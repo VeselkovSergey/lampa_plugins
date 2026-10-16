@@ -2,99 +2,56 @@
 (function () {
     'use strict';
 
-    if (window.Lampa && Lampa.Manifest) {
-    Lampa.Manifest.plugins = {
-        type: 'other',
-        version: '1.0.0',
-        name: 'Lampa NoAds',
-        description: 'Блокировка рекламы при воспроизведении'
-    };
-}
+    if (window.noads_v4_started) return;
+    window.noads_v4_started = true;
 
-    if (window.noads_experiment_started) return;
-    window.noads_experiment_started = true;
+    var originalOpen = XMLHttpRequest.prototype.open;
 
-    var CLEAR_ALL_TIMERS = false;
-    var BLOCK_NEW_VIDEO = true;
+    var EMPTY_ADS_URL =
+        'data:application/json,%7B%22ad%22%3A%5B%5D%7D';
 
-    function notify(message) {
-        console.log('[NoAds] ' + message);
+    var intercepted = 0;
 
-        if (window.Lampa &&
-            Lampa.Noty &&
-            typeof Lampa.Noty.show === 'function') {
-            Lampa.Noty.show('NoAds: ' + message);
-        }
+    function log(message) {
+        console.log('[NoAds v4] ' + message);
     }
 
-    // Эксперимент: перехват создания video.
-    // ВНИМАНИЕ: может заблокировать и сам фильм.
-    if (BLOCK_NEW_VIDEO && document.createElement) {
-        var originalCreateElement = document.createElement;
-
-        document.createElement = function () {
-            var element = originalCreateElement.apply(this, arguments);
-
-            if (String(arguments[0]).toLowerCase() === 'video') {
-                var originalPlay = element.play;
-
-                element.play = function () {
-                    notify('Перехвачено воспроизведение video');
-
-                    // Имитируем завершение.
-                    setTimeout(function () {
-                        element.dispatchEvent(new Event('ended'));
-                    }, 500);
-
-                    return Promise.resolve();
-                };
-
-                element.__noads_original_play = originalPlay;
-            }
-
-            return element;
-        };
-    }
-
-    function clearAllTimers() {
-        var lastId = setTimeout(function () {}, 0);
-
-        for (var i = 0; i <= lastId; i++) {
-            clearTimeout(i);
-            clearInterval(i);
-        }
-
-        notify('Таймеры очищены');
-    }
-
-    if (CLEAR_ALL_TIMERS) {
-        if (document.readyState === 'loading') {
-            document.addEventListener(
-                'DOMContentLoaded',
-                clearAllTimers
+    function isPrerollRequest(method, url) {
+        return String(method).toUpperCase() === 'GET' &&
+            /\/api\/ad\/get\/preroll(?:[?#]|$)/i.test(
+                String(url || '')
             );
-        } else {
-            clearAllTimers();
+    }
+
+    XMLHttpRequest.prototype.open = function (
+        method,
+        url
+    ) {
+        if (isPrerollRequest(method, url)) {
+            intercepted++;
+
+            log(
+                'Запрос preroll перенаправлен. Всего: ' +
+                intercepted
+            );
+
+            /*
+             * Настоящий XHR остаётся нетронутым.
+             * Меняем только адрес рекламного запроса.
+             *
+             * Ответ: {"ad":[]}
+             */
+            var args = Array.prototype.slice.call(
+                arguments
+            );
+
+            args[1] = EMPTY_ADS_URL;
+
+            return originalOpen.apply(this, args);
         }
-    }
 
-    function ready() {
-        notify('Экспериментальный плагин загружен');
-    }
+        return originalOpen.apply(this, arguments);
+    };
 
-    if (window.Lampa && Lampa.Noty) {
-        ready();
-    } else {
-        var attempts = 0;
-        var timer = setInterval(function () {
-            attempts++;
-
-            if (window.Lampa && Lampa.Noty) {
-                clearInterval(timer);
-                ready();
-            } else if (attempts >= 30) {
-                clearInterval(timer);
-            }
-        }, 1000);
-    }
+    log('Активирован перехват запросов preroll');
 })();
