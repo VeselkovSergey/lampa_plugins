@@ -2,112 +2,145 @@
 (function () {
     'use strict';
 
-    if (window.lampa_custom_sync_v8) return;
-    window.lampa_custom_sync_v8 = true;
+    if (window.lampa_custom_sync_v9) return;
+    window.lampa_custom_sync_v9 = true;
 
     var API = 'https://lampa.dev-lead.ru/sync.php';
     var CODE_KEY = 'lampa_custom_sync_code';
 
-    var started = false;
-    var busy = false;
-    var pending = false;
-    var applying = false;
-    var dialogOpen = false;
-    var debounceTimer = null;
-    var lastNavigationSync = 0;
-
     var SECTIONS = [
-        'like', 'wath', 'book', 'card',
-        'history', 'look', 'viewed',
-        'scheduled', 'continued', 'thrown'
+        'like',
+        'wath',
+        'book',
+        'history',
+        'look',
+        'viewed',
+        'scheduled',
+        'continued',
+        'thrown'
     ];
 
-    function log() {
-        var args = ['[Lampa Sync v8]'];
+    var started = false;
+    var busy = false;
+    var queued = false;
+    var applying = false;
+    var debounce = null;
+    var lastNavigation = 0;
 
-        for (var i = 0; i < arguments.length; i++) {
-            args.push(arguments[i]);
-        }
-
-        console.log.apply(console, args);
+    function log(message) {
+        console.log('[Sync v9] ' + message);
     }
 
-    function notify(message) {
+    function notice(message) {
         log(message);
 
-        try {
-            if (Lampa.Noty && Lampa.Noty.show) {
-                Lampa.Noty.show('Sync: ' + message);
-            }
-        } catch (e) {}
+        if (
+            window.Lampa &&
+            Lampa.Noty &&
+            Lampa.Noty.show
+        ) {
+            Lampa.Noty.show('Sync: ' + message);
+        }
     }
 
-    function getCode() {
-        try {
-            return String(
-                localStorage.getItem(CODE_KEY) || ''
-            ).trim();
-        } catch (e) {
-            return '';
-        }
+    function codeNow() {
+        return String(
+            localStorage.getItem(CODE_KEY) || ''
+        ).trim();
     }
 
     function validCode(code) {
         return /^\d{6}$/.test(code);
     }
 
-    function clone(value) {
+    function clone(data) {
         try {
-            return JSON.parse(JSON.stringify(value));
+            return JSON.parse(JSON.stringify(data));
         } catch (e) {
             return {};
         }
     }
 
-    function getStorage(name) {
+    function readStorage(name) {
         try {
-            var value = Lampa.Storage.get(name, {});
+            var x = Lampa.Storage.get(name, {});
 
-            if (value && typeof value === 'object') {
-                return value;
+            if (
+                x &&
+                typeof x === 'object' &&
+                !Array.isArray(x)
+            ) {
+                return x;
             }
-        } catch (e) {
-            log('Ошибка чтения:', name, e);
-        }
+        } catch (e) {}
 
         return {};
     }
 
-    function getFavorite() {
+    function readFavorite() {
         try {
-            var value = Lampa.Favorite.full();
+            var x = Lampa.Favorite.full();
 
-            if (value && typeof value === 'object') {
-                return value;
+            if (
+                x &&
+                typeof x === 'object'
+            ) {
+                return x;
             }
-        } catch (e) {
-            log('Favorite.full:', e);
-        }
+        } catch (e) {}
 
-        return getStorage('favorite');
+        return readStorage('favorite');
     }
 
-    function itemId(item, section) {
-        if (section === 'card') {
-            if (
-                !item ||
-                typeof item !== 'object' ||
-                item.id == null
-            ) {
-                return null;
-            }
+    /*
+     * Очередь операций хранится локально.
+     * Если интернет пропал, добавления
+     * и удаления отправятся позже.
+     */
+    function opKey(code) {
+        return 'lampa_sync_v9_pending_' + code;
+    }
 
-            return String(item.id);
+    function readPending(code) {
+        try {
+            var x = JSON.parse(
+                localStorage.getItem(opKey(code)) || '[]'
+            );
+
+            return Array.isArray(x) ? x : [];
+        } catch (e) {
+            return [];
+        }
+    }
+
+    function savePending(code, ops) {
+        try {
+            localStorage.setItem(
+                opKey(code),
+                JSON.stringify(ops)
+            );
+        } catch (e) {
+            log(
+                'Не удалось сохранить очередь изменений: ' +
+                e.message
+            );
+        }
+    }
+
+    function idOf(item, section) {
+        if (
+            item &&
+            typeof item === 'object'
+        ) {
+            item = item.id;
         }
 
         if (
-            typeof item !== 'number' &&
-            typeof item !== 'string'
+            (
+                typeof item !== 'number' &&
+                typeof item !== 'string'
+            ) ||
+            !/^\d{1,20}$/.test(String(item))
         ) {
             return null;
         }
@@ -115,182 +148,240 @@
         return String(item);
     }
 
-    function mergeFavorites(local, remote) {
-        local = local || {};
-        remote = remote || {};
+    function sectionAllowed(section) {
+        return SECTIONS.indexOf(section) !== -1;
+    }
 
-        var result = {};
-        var keys = SECTIONS.slice();
+    /*
+     * Запись явной операции добавления/удаления.
+     */
+    function queueOperation(verb, section, id) {
+        var code = codeNow();
 
-        Object.keys(local).concat(
-            Object.keys(remote)
-        ).forEach(function (key) {
-            if (keys.indexOf(key) === -1) {
-                keys.push(key);
+        if (
+            !validCode(code) ||
+            !sectionAllowed(section) ||
+            id === null
+        ) {
+            return;
+        }
+
+        var ops = readPending(code);
+
+        ops.push({
+            event_id:
+                'v9_' +
+                Date.now() +
+                '_' +
+                Math.random().toString(36).slice(2) +
+                '_' +
+                Math.random().toString(36).slice(2),
+
+            op: verb,
+            section: section,
+            id: id
+        });
+
+        savePending(code, ops);
+    }
+
+    /*
+     * Индекс удалений, полученных с сервера.
+     */
+    function removedIndex(list) {
+        var index = {};
+
+        (
+            Array.isArray(list) ? list : []
+        ).forEach(function (entry) {
+            if (
+                !entry ||
+                !sectionAllowed(entry.section)
+            ) {
+                return;
+            }
+
+            var id = idOf(
+                entry.id,
+                entry.section
+            );
+
+            if (id !== null) {
+                index[
+                    entry.section + ':' + id
+                ] = true;
             }
         });
 
-        keys.forEach(function (section) {
-            var left = Array.isArray(local[section])
-                ? local[section]
-                : [];
+        return index;
+    }
 
-            var right = Array.isArray(remote[section])
-                ? remote[section]
-                : [];
+    /*
+     * Объединяем избранное.
+     * Удалённые элементы исключаем.
+     */
+    function mergeFavorite(local, remote, removed) {
+        var result = {};
 
-            var merged = [];
-            var seen = Object.create(null);
+        SECTIONS.concat(['card']).forEach(
+            function (section) {
+                var seen = {};
+                var out = [];
 
-            left.concat(right).forEach(function (item) {
-                var id = itemId(item, section);
+                var a = Array.isArray(local[section])
+                    ? local[section]
+                    : [];
 
-                if (id === null) return;
+                var b = Array.isArray(remote[section])
+                    ? remote[section]
+                    : [];
 
-                var key = 'id:' + id;
+                a.concat(b).forEach(function (item) {
+                    var id = idOf(item, section);
 
-                if (seen[key]) return;
+                    if (
+                        id === null ||
+                        seen[id]
+                    ) {
+                        return;
+                    }
 
-                seen[key] = true;
-                merged.push(item);
-            });
+                    if (
+                        section === 'card' &&
+                        (
+                            !item ||
+                            typeof item !== 'object'
+                        )
+                    ) {
+                        return;
+                    }
 
-            result[section] = merged;
-        });
+                    if (
+                        removed[
+                            section + ':' + id
+                        ]
+                    ) {
+                        return;
+                    }
+
+                    seen[id] = true;
+                    out.push(item);
+                });
+
+                result[section] = out;
+            }
+        );
 
         return result;
     }
 
+    function progressIsNewer(old, candidate) {
+        if (
+            !candidate ||
+            typeof candidate !== 'object'
+        ) {
+            return false;
+        }
+
+        if (
+            !old ||
+            typeof old !== 'object'
+        ) {
+            return true;
+        }
+
+        var a = Number(candidate.updated || 0);
+        var b = Number(old.updated || 0);
+
+        if (a !== b) {
+            return a > b;
+        }
+
+        var p = Number(candidate.percent || 0);
+        var q = Number(old.percent || 0);
+
+        if (p !== q) {
+            return p > q;
+        }
+
+        return Number(candidate.time || 0) >
+            Number(old.time || 0);
+    }
+
     function mergeProgress(local, remote) {
-        local = local && typeof local === 'object'
-            ? local
-            : {};
+        var result = clone(local);
 
-        remote = remote && typeof remote === 'object'
-            ? remote
-            : {};
-
-        var result = {};
-
-        Object.keys(local).forEach(function (key) {
-            result[key] = local[key];
-        });
-
-        Object.keys(remote).forEach(function (key) {
-            var incoming = remote[key];
-            var current = result[key];
-
-            if (
-                !incoming ||
-                typeof incoming !== 'object'
-            ) {
-                return;
+        Object.keys(remote || {}).forEach(
+            function (key) {
+                if (
+                    progressIsNewer(
+                        result[key],
+                        remote[key]
+                    )
+                ) {
+                    result[key] = remote[key];
+                }
             }
-
-            if (
-                !current ||
-                typeof current !== 'object'
-            ) {
-                result[key] = incoming;
-                return;
-            }
-
-            var a = Number(current.updated || 0);
-            var b = Number(incoming.updated || 0);
-
-            if (b > a) {
-                result[key] = incoming;
-                return;
-            }
-
-            if (b < a) return;
-
-            var ap = Number(current.percent || 0);
-            var bp = Number(incoming.percent || 0);
-            var at = Number(current.time || 0);
-            var bt = Number(incoming.time || 0);
-
-            if (
-                bp > ap ||
-                (bp === ap && bt > at)
-            ) {
-                result[key] = incoming;
-            }
-        });
+        );
 
         return result;
     }
 
     /*
-     * Сравниваем состав списков, а не порядок.
-     * Это предотвращает лишние Favorite.read().
+     * Учитываем операции, которые появились
+     * во время запроса к серверу.
      */
-    function favoriteCompositionChanged(a, b) {
-        var keys = SECTIONS.slice();
+    function applyUnsent(favorite, local, ops) {
+        ops.forEach(function (op) {
+            if (
+                !op ||
+                !sectionAllowed(op.section)
+            ) {
+                return;
+            }
 
-        Object.keys(a || {}).concat(
-            Object.keys(b || {})
-        ).forEach(function (key) {
-            if (keys.indexOf(key) === -1) {
-                keys.push(key);
+            var section = op.section;
+            var id = idOf(op.id, section);
+
+            if (id === null) {
+                return;
+            }
+
+            favorite[section] = favorite[section]
+                .filter(function (item) {
+                    return idOf(item, section) !== id;
+                });
+
+            if (op.op === 'add') {
+                var source = Array.isArray(local[section])
+                    ? local[section]
+                    : [];
+
+                var original = source.filter(
+                    function (item) {
+                        return idOf(item, section) === id;
+                    }
+                )[0];
+
+                if (typeof original !== 'undefined') {
+                    favorite[section].unshift(original);
+                }
             }
         });
 
-        for (var i = 0; i < keys.length; i++) {
-            var section = keys[i];
-
-            var left = Array.isArray(a[section])
-                ? a[section]
-                : [];
-
-            var right = Array.isArray(b[section])
-                ? b[section]
-                : [];
-
-            if (left.length !== right.length) {
-                return true;
-            }
-
-            var ids = Object.create(null);
-
-            left.forEach(function (item) {
-                var id = itemId(item, section);
-
-                if (id !== null) {
-                    ids['id:' + id] = true;
-                }
-            });
-
-            for (var j = 0; j < right.length; j++) {
-                var id = itemId(right[j], section);
-
-                if (id === null || !ids['id:' + id]) {
-                    return true;
-                }
-            }
-        }
-
-        return false;
+        return favorite;
     }
 
-    function count(favorite, section) {
-        return Array.isArray(favorite[section])
-            ? favorite[section].length
-            : 0;
-    }
-
-    function requestSync(payload, callback) {
-        var xhr = new XMLHttpRequest();
-        var finished = false;
-
-        function finish(error, data) {
-            if (finished) return;
-
-            finished = true;
-            callback(error, data);
-        }
+    /*
+     * Обычный XMLHttpRequest.
+     * Никакой глобальной подмены XHR.
+     */
+    function send(payload, callback) {
+        var xhr;
 
         try {
+            xhr = new XMLHttpRequest();
+
             xhr.open('POST', API, true);
             xhr.timeout = 15000;
 
@@ -299,242 +390,251 @@
                 'application/json'
             );
 
+            var finished = false;
+
+            function done(error, data) {
+                if (finished) return;
+
+                finished = true;
+                callback(error, data);
+            }
+
             xhr.onreadystatechange = function () {
-                if (xhr.readyState !== 4) return;
+                if (xhr.readyState !== 4) {
+                    return;
+                }
 
                 if (
                     xhr.status < 200 ||
                     xhr.status >= 300
                 ) {
-                    finish(
-                        new Error('HTTP ' + xhr.status),
-                        null
+                    return done(
+                        new Error('HTTP ' + xhr.status)
                     );
-                    return;
                 }
 
-                var answer;
+                var response;
 
                 try {
-                    answer = JSON.parse(
+                    response = JSON.parse(
                         xhr.responseText
                     );
                 } catch (e) {
-                    finish(
-                        new Error('Неверный JSON'),
-                        null
+                    return done(
+                        new Error('Ответ не JSON')
                     );
-                    return;
                 }
 
                 if (
-                    !answer ||
-                    answer.ok !== true ||
-                    !answer.data ||
-                    typeof answer.data !== 'object'
+                    !response ||
+                    response.ok !== true ||
+                    !response.data ||
+                    response.data.protocol !== 9
                 ) {
-                    finish(
+                    return done(
                         new Error(
-                            answer && answer.error
-                                ? answer.error
-                                : 'Неверный ответ сервера'
-                        ),
-                        null
+                            'Сервер sync.php не обновлён до v9'
+                        )
                     );
-                    return;
                 }
 
-                finish(null, answer.data);
+                done(null, response.data);
             };
 
             xhr.onerror = function () {
-                finish(
-                    new Error('Ошибка сети'),
-                    null
-                );
+                done(new Error('Ошибка сети'));
             };
 
             xhr.ontimeout = function () {
-                finish(
-                    new Error('Тайм-аут'),
-                    null
-                );
+                done(new Error('Тайм-аут'));
             };
 
             xhr.send(JSON.stringify(payload));
+
         } catch (e) {
-            finish(e, null);
+            callback(e);
         }
     }
 
+    /*
+     * Основная синхронизация.
+     */
     function syncNow(showMessage) {
-        var code = getCode();
+        var code = codeNow();
 
         if (!validCode(code)) {
-            if (showMessage) {
-                notify('Введите код из 6 цифр');
-            }
-
             return;
         }
 
         if (busy) {
-            pending = true;
+            queued = true;
             return;
         }
 
         busy = true;
 
-        var payload = {
+        var ops = readPending(code).slice(0, 400);
+
+        send({
             code: code,
             action: 'sync',
-            data: {
-                favorite: clone(getFavorite()),
-                file_view: clone(
-                    getStorage('file_view')
-                )
-            }
-        };
 
-        requestSync(payload, function (error, data) {
+            data: {
+                favorite: clone(readFavorite()),
+                file_view: clone(
+                    readStorage('file_view')
+                )
+            },
+
+            ops: ops
+
+        }, function (error, data) {
             busy = false;
 
             if (error) {
-                log('Ошибка:', error.message);
+                log(
+                    'Ошибка синхронизации: ' +
+                    error.message
+                );
 
                 if (showMessage) {
-                    notify(error.message);
-                }
-
-                return;
-            }
-
-            if (getCode() !== code) {
-                log('Код изменился, ответ пропущен');
-                return;
-            }
-
-            if (
-                !data.favorite ||
-                typeof data.favorite !== 'object' ||
-                Array.isArray(data.favorite) ||
-                !data.file_view ||
-                typeof data.file_view !== 'object' ||
-                Array.isArray(data.file_view)
-            ) {
-                log('Неверная структура ответа');
-                return;
-            }
-
-            try {
-                applying = true;
-
-                var localFavorite = clone(
-                    getFavorite()
-                );
-
-                var localProgress = clone(
-                    getStorage('file_view')
-                );
-
-                var mergedFavorite = mergeFavorites(
-                    localFavorite,
-                    data.favorite
-                );
-
-                var mergedProgress = mergeProgress(
-                    localProgress,
-                    data.file_view
-                );
-
-                var favoriteChanged =
-                    favoriteCompositionChanged(
-                        localFavorite,
-                        mergedFavorite
-                    );
-
-                /*
-                 * Проверяем, что объединение
-                 * не потеряло локальные ID.
-                 */
-                var historyBefore = count(
-                    localFavorite,
-                    'history'
-                );
-
-                var historyAfter = count(
-                    mergedFavorite,
-                    'history'
-                );
-
-                if (historyAfter < historyBefore) {
-                    throw new Error(
-                        'Защита истории: количество уменьшилось'
+                    notice(
+                        'Ошибка: ' + error.message
                     );
                 }
 
-                if (favoriteChanged) {
-                    Lampa.Storage.set(
-                        'favorite',
-                        mergedFavorite,
-                        true
+            } else if (code === codeNow()) {
+                try {
+                    if (
+                        !data.favorite ||
+                        !data.file_view ||
+                        !Array.isArray(data.removed)
+                    ) {
+                        throw new Error(
+                            'Неполные данные сервера'
+                        );
+                    }
+
+                    applying = true;
+
+                    /*
+                     * Убираем подтверждённые
+                     * сервером операции из очереди.
+                     */
+                    var ack = {};
+
+                    ops.forEach(function (op) {
+                        ack[op.event_id] = true;
+                    });
+
+                    var remaining = readPending(code)
+                        .filter(function (op) {
+                            return !ack[op.event_id];
+                        });
+
+                    savePending(code, remaining);
+
+                    var local = clone(
+                        readFavorite()
+                    );
+
+                    var localProgress = clone(
+                        readStorage('file_view')
+                    );
+
+                    var merged = mergeFavorite(
+                        local,
+                        data.favorite,
+                        removedIndex(data.removed)
+                    );
+
+                    applyUnsent(
+                        merged,
+                        local,
+                        remaining
+                    );
+
+                    var progress = mergeProgress(
+                        localProgress,
+                        data.file_view
                     );
 
                     /*
-                     * Только если реально появились
-                     * новые элементы.
-                     *
-                     * Lampa сама обновит активность.
+                     * Обновляем избранное только
+                     * при фактическом изменении.
                      */
-                    Lampa.Favorite.read();
+                    if (
+                        JSON.stringify(local) !==
+                        JSON.stringify(merged)
+                    ) {
+                        Lampa.Storage.set(
+                            'favorite',
+                            merged,
+                            true
+                        );
 
-                    log('Обновлены списки избранного');
-                }
+                        Lampa.Favorite.read();
+                    }
 
-                if (
-                    JSON.stringify(localProgress) !==
-                    JSON.stringify(mergedProgress)
-                ) {
-                    Lampa.Storage.set(
-                        'file_view',
-                        mergedProgress,
-                        true
+                    /*
+                     * Синхронизация таймкодов.
+                     */
+                    if (
+                        JSON.stringify(localProgress) !==
+                        JSON.stringify(progress)
+                    ) {
+                        Lampa.Storage.set(
+                            'file_view',
+                            progress,
+                            true
+                        );
+
+                        if (
+                            Lampa.Timeline &&
+                            typeof Lampa.Timeline.read ===
+                                'function'
+                        ) {
+                            Lampa.Timeline.read(true);
+                        }
+                    }
+
+                    log(
+                        'OK; ревизия ' +
+                        data.revision +
+                        ', ожидает отправки: ' +
+                        remaining.length
                     );
 
-                    log('Обновлён прогресс');
-                }
+                    if (showMessage) {
+                        notice(
+                            'Синхронизация завершена'
+                        );
+                    }
 
-                log('OK', {
-                    revision: data.revision,
-                    history: count(
-                        mergedFavorite,
-                        'history'
-                    ),
-                    card: count(
-                        mergedFavorite,
-                        'card'
-                    ),
-                    progress: Object.keys(
-                        mergedProgress
-                    ).length,
-                    refreshed: favoriteChanged
-                });
+                    if (remaining.length) {
+                        queued = true;
+                    }
 
-                if (showMessage) {
-                    notify('Синхронизация выполнена');
-                }
-            } catch (e) {
-                log('Ошибка обработки:', e);
+                } catch (e) {
+                    log(
+                        'Не удалось применить ответ: ' +
+                        e.message
+                    );
 
-                if (showMessage) {
-                    notify('Ошибка обработки данных');
+                    if (showMessage) {
+                        notice(
+                            'Ошибка применения: ' +
+                            e.message
+                        );
+                    }
+
+                } finally {
+                    applying = false;
                 }
-            } finally {
-                applying = false;
             }
 
-            if (pending) {
-                pending = false;
+            if (queued) {
+                queued = false;
 
                 setTimeout(function () {
                     syncNow(false);
@@ -543,25 +643,78 @@
         });
     }
 
-    /*
-     * Объединяем несколько изменений в один запрос.
-     */
-    function scheduleSync(delay) {
-        if (applying) return;
+    function scheduleSync(ms) {
+        if (applying) {
+            return;
+        }
 
-        clearTimeout(debounceTimer);
+        clearTimeout(debounce);
 
-        debounceTimer = setTimeout(function () {
-            debounceTimer = null;
+        debounce = setTimeout(function () {
+            debounce = null;
             syncNow(false);
-        }, delay || 2000);
+        }, ms || 2000);
     }
 
     /*
-     * Открытие избранного / истории.
+     * Добавление и удаление избранного
+     * через штатные события Lampa.
+     */
+    function onFavorite(event) {
+        if (
+            !event ||
+            applying ||
+            event.target !== 'favorite' ||
+            event.reason !== 'update'
+        ) {
+            return;
+        }
+
+        if (
+            (
+                event.method === 'add' ||
+                event.method === 'remove'
+            ) &&
+            sectionAllowed(event.type)
+        ) {
+            var id = idOf(
+                event.card,
+                event.type
+            );
+
+            if (id !== null) {
+                queueOperation(
+                    event.method,
+                    event.type,
+                    id
+                );
+            }
+        }
+
+        scheduleSync(2000);
+    }
+
+    /*
+     * Синхронизация изменения прогресса.
+     */
+    function onStorage(event) {
+        if (
+            !applying &&
+            event &&
+            event.name === 'file_view'
+        ) {
+            scheduleSync(5000);
+        }
+    }
+
+    /*
+     * Открытие избранного или истории.
      */
     function onActivity(event) {
-        if (!event || event.type !== 'start') {
+        if (
+            !event ||
+            event.type !== 'start'
+        ) {
             return;
         }
 
@@ -572,136 +725,305 @@
             return;
         }
 
-        /*
-         * Защита от повторных событий
-         * при быстром переключении экранов.
-         */
-        var now = Date.now();
-
-        if (now - lastNavigationSync < 1500) {
+        if (
+            Date.now() - lastNavigation < 1500
+        ) {
             return;
         }
 
-        lastNavigationSync = now;
-
-        log(
-            'Открыт раздел:',
-            event.component,
-            event.object && event.object.type
-        );
-
+        lastNavigation = Date.now();
         scheduleSync(300);
     }
 
-    function onFavoriteState(event) {
-        if (!event || applying) return;
+    /*
+     * Ручное восстановление истории
+     * по сохранённым таймкодам.
+     */
+    function restoreHistory() {
+        var favorite = clone(
+            readFavorite()
+        );
 
-        if (
-            event.target === 'favorite' &&
-            event.reason === 'update'
-        ) {
-            scheduleSync(2000);
-        }
-    }
+        var progress = readStorage(
+            'file_view'
+        );
 
-    function onStorageChange(event) {
-        if (!event || applying) return;
+        var cards = Array.isArray(favorite.card)
+            ? favorite.card
+            : [];
 
-        /*
-         * Изменение прогресса воспроизведения.
-         * Не реагируем на все остальные
-         * настройки Lampa.
-         */
-        if (event.name === 'file_view') {
-            scheduleSync(5000);
-        }
-    }
+        var history = Array.isArray(favorite.history)
+            ? favorite.history
+            : [];
 
-    function openCodeDialog() {
-        if (dialogOpen) return;
+        var known = {};
 
-        if (
-            !Lampa.Input ||
-            !Lampa.Input.edit
-        ) {
-            notify('Клавиатура недоступна');
+        history.forEach(function (id) {
+            known[String(id)] = true;
+        });
+
+        var added = [];
+
+        var hash = Lampa.Utils && Lampa.Utils.hash;
+
+        cards.forEach(function (card) {
+            if (
+                !card ||
+                card.id == null ||
+                known[String(card.id)]
+            ) {
+                return;
+            }
+
+            var type = card.original_name
+                ? 'tv'
+                : 'movie';
+
+            var source = String(
+                card.source || 'tmdb'
+            );
+
+            var cardKey = type + '_' + card.id;
+
+            if (
+                source !== 'tmdb' &&
+                source !== 'cub'
+            ) {
+                cardKey = source + '_' + cardKey;
+            }
+
+            cardKey = cardKey
+                .toLowerCase()
+                .replace(/[^a-z0-9_]/g, '')
+                .slice(0, 64);
+
+            var found = false;
+
+            Object.keys(progress).some(
+                function (key) {
+                    var road = progress[key];
+
+                    if (
+                        !road ||
+                        typeof road !== 'object'
+                    ) {
+                        return false;
+                    }
+
+                    /*
+                     * Не восстанавливаем запись
+                     * без реального прогресса.
+                     */
+                    if (
+                        !(
+                            Number(road.percent || 0) > 0 ||
+                            Number(road.time || 0) >= 60
+                        )
+                    ) {
+                        return false;
+                    }
+
+                    /*
+                     * Новый вариант связи таймкода
+                     * с карточкой.
+                     */
+                    if (road.card === cardKey) {
+                        found = true;
+                        return true;
+                    }
+
+                    if (
+                        road.card ||
+                        typeof hash !== 'function'
+                    ) {
+                        return false;
+                    }
+
+                    /*
+                     * Старые таймкоды фильмов.
+                     */
+                    if (type === 'movie') {
+                        found = (
+                            !!card.original_title &&
+                            String(
+                                hash(card.original_title)
+                            ) === key
+                        );
+
+                    } else if (card.original_name) {
+                        /*
+                         * Старые таймкоды сериалов.
+                         */
+                        var seasons = Math.min(
+                            20,
+                            Number(
+                                card.number_of_seasons
+                            ) || 10
+                        );
+
+                        for (
+                            var s = 1;
+                            s <= seasons && !found;
+                            s++
+                        ) {
+                            for (
+                                var ep = 1;
+                                ep <= 30;
+                                ep++
+                            ) {
+                                var label =
+                                    String(s) +
+                                    (s > 10 ? ':' : '') +
+                                    ep +
+                                    card.original_name;
+
+                                if (
+                                    String(hash(label)) ===
+                                    key
+                                ) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    return found;
+                }
+            );
+
+            if (found) {
+                known[String(card.id)] = true;
+                added.push(card.id);
+            }
+        });
+
+        if (!added.length) {
+            notice(
+                'История: совпадений не найдено. ' +
+                'Для старых таймкодов нужны ' +
+                'карточки фильмов.'
+            );
             return;
         }
 
-        dialogOpen = true;
+        /*
+         * Не заменяем существующую историю,
+         * только дополняем её.
+         */
+        favorite.history = added.concat(history);
 
         try {
-            Lampa.Input.edit({
-                title: 'Код синхронизации',
-                value: getCode(),
-                free: true,
-                nosave: true
-            }, function (value) {
-                dialogOpen = false;
+            applying = true;
 
-                if (
-                    value === null ||
-                    typeof value === 'undefined'
-                ) {
-                    return;
-                }
+            Lampa.Storage.set(
+                'favorite',
+                favorite,
+                true
+            );
 
-                var code = String(value).trim();
+            Lampa.Favorite.read();
 
-                if (!validCode(code)) {
-                    notify('Нужно ровно 6 цифр');
-                    return;
-                }
-
-                try {
-                    localStorage.setItem(
-                        CODE_KEY,
-                        code
-                    );
-                } catch (e) {
-                    notify('Ошибка сохранения кода');
-                    return;
-                }
-
-                notify('Код сохранён');
-
-                setTimeout(function () {
-                    syncNow(true);
-                }, 1000);
-            });
-        } catch (e) {
-            dialogOpen = false;
-            log('Ошибка клавиатуры:', e);
+        } finally {
+            applying = false;
         }
+
+        added.forEach(function (id) {
+            queueOperation(
+                'add',
+                'history',
+                String(id)
+            );
+        });
+
+        notice(
+            'Восстановлено записей истории: ' +
+            added.length
+        );
+
+        scheduleSync(1000);
     }
 
+    /*
+     * Редактирование кода синхронизации.
+     */
+    function editCode() {
+        Lampa.Input.edit({
+            title: 'Код синхронизации',
+            value: codeNow(),
+            free: true,
+            nosave: true
+
+        }, function (value) {
+            var code = String(value || '').trim();
+
+            if (!validCode(code)) {
+                return notice(
+                    'Нужен код из 6 цифр'
+                );
+            }
+
+            localStorage.setItem(
+                CODE_KEY,
+                code
+            );
+
+            setTimeout(function () {
+                syncNow(true);
+            }, 1000);
+        });
+    }
+
+    /*
+     * Кнопки настроек Lampa.
+     */
     function installSettings() {
         Lampa.SettingsApi.addParam({
             component: 'more',
+
             param: {
-                name: 'lampa_sync_code_v8',
+                name: 'lampa_sync_v9_code',
                 type: 'button'
             },
+
             field: {
                 name: 'Sync: изменить код'
             },
-            onChange: openCodeDialog
+
+            onChange: editCode
         });
 
         Lampa.SettingsApi.addParam({
             component: 'more',
+
             param: {
-                name: 'lampa_sync_now_v8',
+                name: 'lampa_sync_v9_now',
                 type: 'button'
             },
+
             field: {
                 name: 'Sync: синхронизировать сейчас'
             },
+
             onChange: function () {
-                clearTimeout(debounceTimer);
-                debounceTimer = null;
                 syncNow(true);
             }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'more',
+
+            param: {
+                name: 'lampa_sync_v9_restore_history',
+                type: 'button'
+            },
+
+            field: {
+                name:
+                    'Sync: восстановить историю по просмотрам'
+            },
+
+            onChange: restoreHistory
         });
     }
 
@@ -728,50 +1050,60 @@
         installSettings();
 
         Lampa.Listener.follow(
+            'state:changed',
+            onFavorite
+        );
+
+        Lampa.Listener.follow(
             'activity',
             onActivity
         );
 
-        Lampa.Listener.follow(
-            'state:changed',
-            onFavoriteState
-        );
-
         Lampa.Storage.listener.follow(
             'change',
-            onStorageChange
+            onStorage
         );
 
         window.lampaCustomSyncNow = function () {
             syncNow(true);
         };
 
-        window.lampaCustomSyncCode = openCodeDialog;
+        window.lampaSyncRestoreHistory =
+            restoreHistory;
 
         /*
          * Одна синхронизация при запуске.
-         * Периодических таймеров НЕТ.
+         * Далее только по событиям.
          */
-        if (validCode(getCode())) {
+        if (validCode(codeNow())) {
             setTimeout(function () {
                 syncNow(false);
             }, 3000);
         }
 
         log(
-            'Запущен: синхронизация по событиям, без опроса'
+            'Запущен. События + журнал удалений, ' +
+            'без периодического опроса.'
         );
 
         return true;
     }
 
+    /*
+     * Ожидание инициализации Lampa.
+     * Интервал прекращается после запуска.
+     */
     var attempts = 0;
 
     var wait = setInterval(function () {
         attempts++;
 
-        if (init() || attempts >= 90) {
+        if (
+            init() ||
+            attempts >= 90
+        ) {
             clearInterval(wait);
         }
     }, 1000);
+
 })();
