@@ -2,157 +2,290 @@
 (function () {
     'use strict';
 
-    // Новая версия. Старый плагин нужно заменить по тому же URL.
-    if (window.lampa_custom_sync_v5) return;
-    window.lampa_custom_sync_v5 = true;
+    if (window.lampa_custom_sync_v6) return;
+    window.lampa_custom_sync_v6 = true;
 
     var API = 'https://lampa.dev-lead.ru/sync.php';
-    var KEY = 'lampa_custom_sync_code';
+    var CODE_KEY = 'lampa_custom_sync_code';
+
     var busy = false;
     var started = false;
+    var codeDialogOpen = false;
+    var syncTimer = null;
 
     var SECTIONS = [
-        'like', 'wath', 'book', 'history',
-        'look', 'viewed', 'scheduled',
-        'continued', 'thrown'
+        'like',
+        'wath',
+        'book',
+        'history',
+        'look',
+        'viewed',
+        'scheduled',
+        'continued',
+        'thrown'
     ];
 
     function log() {
-        console.log.apply(console, ['[Lampa Sync v5]'].concat(
-            Array.prototype.slice.call(arguments)
-        ));
+        var args = ['[Lampa Sync v6]'];
+
+        for (var i = 0; i < arguments.length; i++) {
+            args.push(arguments[i]);
+        }
+
+        console.log.apply(console, args);
     }
 
-    function notice(message) {
+    function notify(message) {
         log(message);
 
-        if (Lampa.Noty && Lampa.Noty.show) {
-            Lampa.Noty.show('Sync: ' + message);
+        try {
+            if (Lampa.Noty && Lampa.Noty.show) {
+                Lampa.Noty.show('Sync: ' + message);
+            }
+        } catch (e) {}
+    }
+
+    function getCode() {
+        try {
+            return String(
+                localStorage.getItem(CODE_KEY) || ''
+            ).trim();
+        } catch (e) {
+            return '';
         }
+    }
+
+    function validCode(code) {
+        return /^\d{6}$/.test(code);
     }
 
     function storageGet(name) {
         try {
-            return Lampa.Storage.get(name, {});
-        } catch (e) {
-            log('Ошибка чтения', name, e);
-            return {};
-        }
-    }
+            var value = Lampa.Storage.get(name, {});
 
-    function storageSet(name, value) {
-        Lampa.Storage.set(name, value);
+            if (value && typeof value === 'object') {
+                return value;
+            }
+        } catch (e) {
+            log('Ошибка чтения:', name, e);
+        }
+
+        return {};
     }
 
     function getFavorite() {
         try {
-            return Lampa.Favorite.full();
+            var value = Lampa.Favorite.full();
+
+            if (value && typeof value === 'object') {
+                return value;
+            }
         } catch (e) {
-            return storageGet('favorite');
+            log('Favorite.full error:', e);
+        }
+
+        return storageGet('favorite');
+    }
+
+    function clone(value) {
+        try {
+            return JSON.parse(JSON.stringify(value));
+        } catch (e) {
+            return {};
         }
     }
 
-    function idOf(item, section) {
+    function itemId(item, section) {
         if (section === 'card') {
-            if (!item || typeof item !== 'object' ||
-                item.id == null) return null;
+            if (
+                !item ||
+                typeof item !== 'object' ||
+                item.id == null
+            ) {
+                return null;
+            }
 
             return String(item.id);
         }
 
-        if (typeof item !== 'number' &&
-            typeof item !== 'string') return null;
+        if (
+            typeof item !== 'number' &&
+            typeof item !== 'string'
+        ) {
+            return null;
+        }
 
         return String(item);
     }
 
-    function mergeFavorites(a, b) {
-        a = a || {};
-        b = b || {};
+    function mergeFavorites(local, remote) {
+        local = local || {};
+        remote = remote || {};
 
         var result = {};
-        var keys = Object.keys(a).concat(Object.keys(b));
+        var keys = SECTIONS.concat(['card']);
 
-        SECTIONS.concat(['card']).forEach(function (key) {
-            if (keys.indexOf(key) === -1) keys.push(key);
+        Object.keys(local).concat(
+            Object.keys(remote)
+        ).forEach(function (key) {
+            if (keys.indexOf(key) === -1) {
+                keys.push(key);
+            }
         });
 
-        keys.forEach(function (key) {
-            var left = Array.isArray(a[key]) ? a[key] : [];
-            var right = Array.isArray(b[key]) ? b[key] : [];
+        keys.forEach(function (section) {
+            var a = Array.isArray(local[section])
+                ? local[section]
+                : [];
 
-            var seen = {};
+            var b = Array.isArray(remote[section])
+                ? remote[section]
+                : [];
+
+            var seen = Object.create(null);
             var merged = [];
 
-            left.concat(right).forEach(function (item) {
-                var id = idOf(item, key);
+            a.concat(b).forEach(function (item) {
+                var id = itemId(item, section);
 
-                if (id === null || seen[id]) return;
+                if (id === null) return;
 
-                seen[id] = true;
+                var key = 'id:' + id;
+
+                if (seen[key]) return;
+
+                seen[key] = true;
                 merged.push(item);
             });
 
-            result[key] = merged;
+            result[section] = merged;
         });
 
         return result;
     }
 
-    function mergeProgress(a, b) {
-        a = a && typeof a === 'object' ? a : {};
-        b = b && typeof b === 'object' ? b : {};
+    function mergeProgress(local, remote) {
+        local = local && typeof local === 'object'
+            ? local
+            : {};
 
-        var result = Object.assign({}, a);
+        remote = remote && typeof remote === 'object'
+            ? remote
+            : {};
 
-        Object.keys(b).forEach(function (key) {
-            var remote = b[key];
-            var local = result[key];
+        var result = Object.assign({}, local);
 
-            if (!remote || typeof remote !== 'object') return;
+        Object.keys(remote).forEach(function (key) {
+            var incoming = remote[key];
+            var current = result[key];
 
-            if (!local) {
-                result[key] = remote;
+            if (
+                !incoming ||
+                typeof incoming !== 'object'
+            ) {
                 return;
             }
 
-            var remoteUpdated = Number(remote.updated || 0);
-            var localUpdated = Number(local.updated || 0);
+            if (
+                !current ||
+                typeof current !== 'object'
+            ) {
+                result[key] = incoming;
+                return;
+            }
 
-            if (remoteUpdated > localUpdated) {
-                result[key] = remote;
+            var currentUpdated = Number(
+                current.updated || 0
+            );
+
+            var incomingUpdated = Number(
+                incoming.updated || 0
+            );
+
+            if (incomingUpdated > currentUpdated) {
+                result[key] = incoming;
+                return;
+            }
+
+            if (incomingUpdated < currentUpdated) {
+                return;
+            }
+
+            var currentPercent = Number(
+                current.percent || 0
+            );
+
+            var incomingPercent = Number(
+                incoming.percent || 0
+            );
+
+            var currentTime = Number(
+                current.time || 0
+            );
+
+            var incomingTime = Number(
+                incoming.time || 0
+            );
+
+            if (
+                incomingPercent > currentPercent ||
+                (
+                    incomingPercent === currentPercent &&
+                    incomingTime > currentTime
+                )
+            ) {
+                result[key] = incoming;
             }
         });
 
         return result;
     }
 
-    function counts(f) {
-        var result = {};
-
-        SECTIONS.concat(['card']).forEach(function (key) {
-            result[key] = Array.isArray(f[key])
-                ? f[key].length
-                : 0;
-        });
-
-        return result;
+    function favoriteCounts(data) {
+        return {
+            like: (data.like || []).length,
+            book: (data.book || []).length,
+            history: (data.history || []).length,
+            card: (data.card || []).length
+        };
     }
 
-    function syncNow() {
-        var code = localStorage.getItem(KEY);
+    function syncNow(showMessage) {
+        if (busy) {
+            log('Синхронизация уже выполняется');
+            return;
+        }
 
-        if (!/^\d{6}$/.test(code || '') || busy) return;
+        var code = getCode();
+
+        if (!validCode(code)) {
+            if (showMessage) {
+                notify('Сначала введите код');
+            }
+
+            return;
+        }
 
         busy = true;
 
-        // Снимок данных перед запросом.
         var outgoing = {
-            favorite: getFavorite(),
-            file_view: storageGet('file_view')
+            favorite: clone(getFavorite()),
+            file_view: clone(storageGet('file_view'))
         };
 
-        fetch(API, {
+        log('Начало синхронизации');
+
+        var controller = typeof AbortController !== 'undefined'
+            ? new AbortController()
+            : null;
+
+        var timeout = setTimeout(function () {
+            if (controller) {
+                controller.abort();
+            }
+        }, 15000);
+
+        var options = {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
@@ -162,108 +295,222 @@
                 action: 'sync',
                 data: outgoing
             })
-        })
-        .then(function (response) {
-            if (!response.ok) {
-                throw new Error('HTTP ' + response.status);
-            }
+        };
 
-            return response.json();
-        })
-        .then(function (answer) {
-            if (!answer.ok || !answer.data) {
-                throw new Error('Некорректный ответ сервера');
-            }
+        if (controller) {
+            options.signal = controller.signal;
+        }
 
-            // ВАЖНО: перечитываем локальные данные ПОСЛЕ
-            // ответа сервера, чтобы не потерять изменения,
-            // сделанные во время сетевого запроса.
-            var currentFavorite = getFavorite();
-            var currentProgress = storageGet('file_view');
+        fetch(API, options)
+            .then(function (response) {
+                if (!response.ok) {
+                    throw new Error(
+                        'HTTP ' + response.status
+                    );
+                }
 
-            var favorite = mergeFavorites(
-                currentFavorite,
-                answer.data.favorite
-            );
+                return response.json();
+            })
+            .then(function (answer) {
+                if (
+                    !answer ||
+                    answer.ok !== true ||
+                    !answer.data
+                ) {
+                    throw new Error(
+                        answer && answer.error
+                            ? answer.error
+                            : 'Неверный ответ сервера'
+                    );
+                }
 
-            var progress = mergeProgress(
-                currentProgress,
-                answer.data.file_view
-            );
+                // Код мог измениться во время запроса.
+                if (getCode() !== code) {
+                    log('Код изменён, ответ пропущен');
+                    return;
+                }
 
-            // Запись через штатный Storage Lampa.
-            storageSet('favorite', favorite);
-            storageSet('file_view', progress);
+                // Берём самые свежие локальные данные.
+                var currentFavorite = clone(
+                    getFavorite()
+                );
 
-            // Обновляем внутреннее состояние Favorite.
-            Lampa.Favorite.read();
+                var currentProgress = clone(
+                    storageGet('file_view')
+                );
 
-            log('Синхронизация OK', {
-                revision: answer.data.revision,
-                favorite: counts(favorite),
-                progress: Object.keys(progress).length
+                var mergedFavorite = mergeFavorites(
+                    currentFavorite,
+                    answer.data.favorite || {}
+                );
+
+                var mergedProgress = mergeProgress(
+                    currentProgress,
+                    answer.data.file_view || {}
+                );
+
+                // Не перечитываем Favorite без необходимости.
+                if (
+                    JSON.stringify(currentFavorite) !==
+                    JSON.stringify(mergedFavorite)
+                ) {
+                    Lampa.Storage.set(
+                        'favorite',
+                        mergedFavorite
+                    );
+
+                    Lampa.Favorite.read();
+
+                    log('Избранное обновлено');
+                }
+
+                if (
+                    JSON.stringify(currentProgress) !==
+                    JSON.stringify(mergedProgress)
+                ) {
+                    Lampa.Storage.set(
+                        'file_view',
+                        mergedProgress
+                    );
+
+                    log('Прогресс обновлён');
+                }
+
+                log('OK', {
+                    revision: answer.data.revision,
+                    favorite: favoriteCounts(
+                        mergedFavorite
+                    ),
+                    progress: Object.keys(
+                        mergedProgress
+                    ).length
+                });
+
+                if (showMessage) {
+                    notify('Синхронизация выполнена');
+                }
+            })
+            .catch(function (error) {
+                log('Ошибка синхронизации:', error);
+
+                if (showMessage) {
+                    notify(
+                        'Ошибка синхронизации: ' +
+                        error.message
+                    );
+                }
+            })
+            .then(function () {
+                clearTimeout(timeout);
+                busy = false;
             });
-        })
-        .catch(function (error) {
-            console.error('[Lampa Sync v5]', error);
-            notice('Ошибка: ' + error.message);
-        })
-        .finally(function () {
-            busy = false;
-        });
     }
 
-    function askCode() {
-        Lampa.Input.edit({
-            title: 'Код синхронизации (6 цифр)',
-            value: localStorage.getItem(KEY) || '',
-            free: true,
-            nosave: true,
-            nomic: true,
-            layout: 'nums',
-            keyboard: 'lampa'
-        }, function (value) {
-            var code = String(value || '').trim();
+    function openCodeDialog() {
+        if (codeDialogOpen) {
+            log('Окно ввода уже открыто');
+            return;
+        }
 
-            if (!/^\d{6}$/.test(code)) {
-                notice('Нужно ровно 6 цифр');
-                return;
-            }
+        if (!Lampa.Input || !Lampa.Input.edit) {
+            notify('Ввод кода недоступен');
+            return;
+        }
 
-            localStorage.setItem(KEY, code);
-            notice('Код сохранён');
-            syncNow();
-        });
+        codeDialogOpen = true;
+
+        var currentCode = getCode();
+
+        /*
+         * На LG используем минимальный набор
+         * параметров штатного окна Lampa.
+         *
+         * Без принудительного layout: nums
+         * и keyboard: lampa.
+         */
+        try {
+            Lampa.Input.edit({
+                title: 'Код синхронизации',
+                value: currentCode,
+                free: true,
+                nosave: true
+            }, function (value) {
+                codeDialogOpen = false;
+
+                // Отмена ввода — код не меняем.
+                if (value === null ||
+                    typeof value === 'undefined') {
+                    return;
+                }
+
+                var code = String(value).trim();
+
+                if (!validCode(code)) {
+                    notify('Введите ровно 6 цифр');
+                    return;
+                }
+
+                try {
+                    localStorage.setItem(
+                        CODE_KEY,
+                        code
+                    );
+                } catch (e) {
+                    notify('Не удалось сохранить код');
+                    return;
+                }
+
+                notify('Код сохранён');
+
+                /*
+                 * Не запускаем сетевой запрос
+                 * непосредственно внутри callback
+                 * клавиатуры LG.
+                 */
+                setTimeout(function () {
+                    syncNow(true);
+                }, 800);
+            });
+        } catch (error) {
+            codeDialogOpen = false;
+            log('Ошибка открытия клавиатуры:', error);
+            notify('Не удалось открыть ввод кода');
+        }
     }
 
     function installSettings() {
-        if (!Lampa.SettingsApi ||
-            !Lampa.SettingsApi.addParam) return;
+        if (
+            !Lampa.SettingsApi ||
+            !Lampa.SettingsApi.addParam
+        ) {
+            return;
+        }
 
         Lampa.SettingsApi.addParam({
             component: 'more',
             param: {
-                name: 'lampa_custom_sync_code_v5',
+                name: 'lampa_sync_code_v6',
                 type: 'button'
             },
             field: {
-                name: 'Ввести / изменить код синхронизации'
+                name: 'Sync: ввести / изменить код'
             },
-            onChange: askCode
+            onChange: function () {
+                openCodeDialog();
+            }
         });
 
         Lampa.SettingsApi.addParam({
             component: 'more',
             param: {
-                name: 'lampa_custom_sync_now_v5',
+                name: 'lampa_sync_now_v6',
                 type: 'button'
             },
             field: {
-                name: 'Синхронизировать сейчас'
+                name: 'Sync: синхронизировать сейчас'
             },
             onChange: function () {
-                notice('Синхронизация запущена');
-                syncNow();
+                syncNow(true);
             }
         });
     }
@@ -271,12 +518,17 @@
     function init() {
         if (started) return true;
 
-        if (!window.Lampa ||
+        if (
+            !window.Lampa ||
             !Lampa.Storage ||
+            !Lampa.Storage.get ||
+            !Lampa.Storage.set ||
             !Lampa.Favorite ||
             !Lampa.Favorite.full ||
             !Lampa.Favorite.read ||
-            !Lampa.Input) {
+            !Lampa.Input ||
+            !Lampa.SettingsApi
+        ) {
             return false;
         }
 
@@ -284,28 +536,34 @@
 
         installSettings();
 
-        window.lampaCustomSyncNow = syncNow;
-        window.lampaCustomSyncCode = askCode;
+        window.lampaCustomSyncNow = function () {
+            syncNow(true);
+        };
 
-        setInterval(syncNow, 30000);
+        window.lampaCustomSyncCode = openCodeDialog;
 
-        if (localStorage.getItem(KEY)) {
-            syncNow();
-        } else {
-            setTimeout(askCode, 1500);
+        syncTimer = setInterval(function () {
+            syncNow(false);
+        }, 30000);
+
+        // Только синхронизация, без открытия клавиатуры.
+        if (validCode(getCode())) {
+            setTimeout(function () {
+                syncNow(false);
+            }, 2500);
         }
 
-        log('Плагин запущен');
+        log('Запущен');
         return true;
     }
 
     var attempts = 0;
 
-    var timer = setInterval(function () {
+    var waitTimer = setInterval(function () {
         attempts++;
 
-        if (init() || attempts >= 60) {
-            clearInterval(timer);
+        if (init() || attempts >= 90) {
+            clearInterval(waitTimer);
         }
     }, 1000);
 })();
