@@ -3,32 +3,36 @@
     'use strict';
 
     function startPlugin() {
-        if (!window.Lampa || !Lampa.Player) return;
-        if (window.noads_plugin) return;
+        if (!window.Lampa || !Lampa.Player || !Lampa.Player.listener) {
+            console.log('[NoAds] Player API unavailable');
+            return;
+        }
 
-        window.noads_plugin = true;
+        if (window.noads_plugin_started) return;
+        window.noads_plugin_started = true;
 
-        function clean(data) {
-            if (!data || typeof data !== 'object') return;
+        Lampa.Player.listener.follow('create', function (event) {
+            var data = event && event.data;
+            if (!data) return;
 
             delete data.vast_url;
             delete data.vast_msg;
             delete data.vast_region;
             delete data.vast_platform;
             delete data.vast_screen;
-        }
 
-        var originalPlay = Lampa.Player.play;
+            console.log('[NoAds] VAST parameters removed');
+        });
 
-        if (typeof originalPlay === 'function') {
-            Lampa.Player.play = function () {
-                clean(arguments[0]);
-                return originalPlay.apply(this, arguments);
-            };
-        }
-
-        console.log('[NoAds] Plugin started');
+        console.log('[NoAds] Player listener installed');
     }
 
-    startPlugin();
+    if (window.appready) {
+        startPlugin();
+    } else if (window.Lampa && Lampa.Listener) {
+        Lampa.Listener.follow('app', function (event) {
+            if (event.type === 'ready') startPlugin();
+        });
+    }
+
 })();
