@@ -2,99 +2,103 @@
 (function () {
     'use strict';
 
-    if (window.Lampa && Lampa.Manifest) {
-    Lampa.Manifest.plugins = {
-        type: 'other',
-        version: '1.0.0',
-        name: 'Lampa NoAds',
-        description: 'Блокировка рекламы при воспроизведении'
-    };
-}
+    if (window.noads_direct_v2) return;
+    window.noads_direct_v2 = true;
 
-    if (window.noads_experiment_started) return;
-    window.noads_experiment_started = true;
+    var STYLE_ID = 'noads-direct-style';
 
-    var CLEAR_ALL_TIMERS = false;
-    var BLOCK_NEW_VIDEO = true;
-
-    function notify(message) {
-        console.log('[NoAds] ' + message);
-
-        if (window.Lampa &&
-            Lampa.Noty &&
-            typeof Lampa.Noty.show === 'function') {
-            Lampa.Noty.show('NoAds: ' + message);
-        }
+    function log(message) {
+        console.log('[NoAds Direct] ' + message);
     }
 
-    // Эксперимент: перехват создания video.
-    // ВНИМАНИЕ: может заблокировать и сам фильм.
-    if (BLOCK_NEW_VIDEO && document.createElement) {
-        var originalCreateElement = document.createElement;
+    function installStyle() {
+        if (document.getElementById(STYLE_ID)) return;
 
-        document.createElement = function () {
-            var element = originalCreateElement.apply(this, arguments);
+        var style = document.createElement('style');
+        style.id = STYLE_ID;
 
-            if (String(arguments[0]).toLowerCase() === 'video') {
-                var originalPlay = element.play;
+        /*
+         * Скрываем только элементы рекламного
+         * интерфейса Lampa.
+         *
+         * Не трогаем video, iframe и сам плеер.
+         */
+        style.textContent = [
+            '.ad-preroll,',
+            '.ad-video-block,',
+            '.ad-bot,',
+            '.ad-card,',
+            '.ad-offer,',
+            '.ad-premiere {',
+            '  display: none !important;',
+            '}'
+        ].join('\n');
 
-                element.play = function () {
-                    notify('Перехвачено воспроизведение video');
-
-                    // Имитируем завершение.
-                    setTimeout(function () {
-                        element.dispatchEvent(new Event('ended'));
-                    }, 500);
-
-                    return Promise.resolve();
-                };
-
-                element.__noads_original_play = originalPlay;
-            }
-
-            return element;
-        };
+        (document.head || document.documentElement)
+            .appendChild(style);
     }
 
-    function clearAllTimers() {
-        var lastId = setTimeout(function () {}, 0);
+    function trySkip() {
+        /*
+         * Здесь нет имитации ended и нет
+         * перехвата HTMLVideoElement.play().
+         *
+         * Ищем только явно существующие
+         * кнопки пропуска рекламы.
+         */
+        var selectors = [
+            '.ad-video-block .ad-skip',
+            '.ad-preroll .ad-skip'
+        ];
 
-        for (var i = 0; i <= lastId; i++) {
-            clearTimeout(i);
-            clearInterval(i);
-        }
-
-        notify('Таймеры очищены');
-    }
-
-    if (CLEAR_ALL_TIMERS) {
-        if (document.readyState === 'loading') {
-            document.addEventListener(
-                'DOMContentLoaded',
-                clearAllTimers
+        for (var i = 0; i < selectors.length; i++) {
+            var button = document.querySelector(
+                selectors[i]
             );
-        } else {
-            clearAllTimers();
+
+            if (button && typeof button.click === 'function') {
+                button.click();
+                log('Нажата кнопка пропуска рекламы');
+                return;
+            }
         }
     }
 
-    function ready() {
-        notify('Экспериментальный плагин загружен');
+    function checkAds() {
+        try {
+            installStyle();
+            trySkip();
+        } catch (e) {
+            log('Ошибка: ' + e.message);
+        }
     }
 
-    if (window.Lampa && Lampa.Noty) {
-        ready();
-    } else {
-        var attempts = 0;
-        var timer = setInterval(function () {
-            attempts++;
+    function start() {
+        installStyle();
 
-            if (window.Lampa && Lampa.Noty) {
-                clearInterval(timer);
-                ready();
-            } else if (attempts >= 30) {
-                clearInterval(timer);
-            }
-        }, 1000);
+        if (typeof MutationObserver !== 'undefined') {
+            var observer = new MutationObserver(function () {
+                trySkip();
+            });
+
+            observer.observe(
+                document.body || document.documentElement,
+                {
+                    childList: true,
+                    subtree: true
+                }
+            );
+        }
+
+        log('Экспериментальный режим запущен');
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener(
+            'DOMContentLoaded',
+            start
+        );
+    } else {
+        start();
     }
 })();
