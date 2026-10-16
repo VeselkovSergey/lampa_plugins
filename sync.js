@@ -2,31 +2,24 @@
 (function () {
     'use strict';
 
-    if (window.lampa_custom_sync_v6) return;
-    window.lampa_custom_sync_v6 = true;
+    if (window.lampa_custom_sync_v7) return;
+    window.lampa_custom_sync_v7 = true;
 
     var API = 'https://lampa.dev-lead.ru/sync.php';
     var CODE_KEY = 'lampa_custom_sync_code';
 
     var busy = false;
     var started = false;
-    var codeDialogOpen = false;
-    var syncTimer = null;
+    var dialogOpen = false;
 
     var SECTIONS = [
-        'like',
-        'wath',
-        'book',
-        'history',
-        'look',
-        'viewed',
-        'scheduled',
-        'continued',
-        'thrown'
+        'like', 'wath', 'book', 'card',
+        'history', 'look', 'viewed',
+        'scheduled', 'continued', 'thrown'
     ];
 
     function log() {
-        var args = ['[Lampa Sync v6]'];
+        var args = ['[Lampa Sync v7]'];
 
         for (var i = 0; i < arguments.length; i++) {
             args.push(arguments[i]);
@@ -59,7 +52,15 @@
         return /^\d{6}$/.test(code);
     }
 
-    function storageGet(name) {
+    function clone(value) {
+        try {
+            return JSON.parse(JSON.stringify(value));
+        } catch (e) {
+            return {};
+        }
+    }
+
+    function getStorage(name) {
         try {
             var value = Lampa.Storage.get(name, {});
 
@@ -67,7 +68,7 @@
                 return value;
             }
         } catch (e) {
-            log('Ошибка чтения:', name, e);
+            log('Storage.get error:', name, e);
         }
 
         return {};
@@ -75,23 +76,9 @@
 
     function getFavorite() {
         try {
-            var value = Lampa.Favorite.full();
-
-            if (value && typeof value === 'object') {
-                return value;
-            }
+            return Lampa.Favorite.full();
         } catch (e) {
-            log('Favorite.full error:', e);
-        }
-
-        return storageGet('favorite');
-    }
-
-    function clone(value) {
-        try {
-            return JSON.parse(JSON.stringify(value));
-        } catch (e) {
-            return {};
+            return getStorage('favorite');
         }
     }
 
@@ -118,12 +105,17 @@
         return String(item);
     }
 
+    /*
+     * Только объединение.
+     * Отсутствие фильма на другом устройстве
+     * НЕ означает удаление.
+     */
     function mergeFavorites(local, remote) {
         local = local || {};
         remote = remote || {};
 
         var result = {};
-        var keys = SECTIONS.concat(['card']);
+        var keys = SECTIONS.slice();
 
         Object.keys(local).concat(
             Object.keys(remote)
@@ -134,18 +126,18 @@
         });
 
         keys.forEach(function (section) {
-            var a = Array.isArray(local[section])
+            var left = Array.isArray(local[section])
                 ? local[section]
                 : [];
 
-            var b = Array.isArray(remote[section])
+            var right = Array.isArray(remote[section])
                 ? remote[section]
                 : [];
 
-            var seen = Object.create(null);
             var merged = [];
+            var seen = Object.create(null);
 
-            a.concat(b).forEach(function (item) {
+            left.concat(right).forEach(function (item) {
                 var id = itemId(item, section);
 
                 if (id === null) return;
@@ -173,7 +165,11 @@
             ? remote
             : {};
 
-        var result = Object.assign({}, local);
+        var result = {};
+
+        Object.keys(local).forEach(function (key) {
+            result[key] = local[key];
+        });
 
         Object.keys(remote).forEach(function (key) {
             var incoming = remote[key];
@@ -194,45 +190,25 @@
                 return;
             }
 
-            var currentUpdated = Number(
-                current.updated || 0
-            );
+            var a = Number(current.updated || 0);
+            var b = Number(incoming.updated || 0);
 
-            var incomingUpdated = Number(
-                incoming.updated || 0
-            );
-
-            if (incomingUpdated > currentUpdated) {
+            if (b > a) {
                 result[key] = incoming;
                 return;
             }
 
-            if (incomingUpdated < currentUpdated) {
-                return;
-            }
+            if (b < a) return;
 
-            var currentPercent = Number(
-                current.percent || 0
-            );
+            var ap = Number(current.percent || 0);
+            var bp = Number(incoming.percent || 0);
 
-            var incomingPercent = Number(
-                incoming.percent || 0
-            );
-
-            var currentTime = Number(
-                current.time || 0
-            );
-
-            var incomingTime = Number(
-                incoming.time || 0
-            );
+            var at = Number(current.time || 0);
+            var bt = Number(incoming.time || 0);
 
             if (
-                incomingPercent > currentPercent ||
-                (
-                    incomingPercent === currentPercent &&
-                    incomingTime > currentTime
-                )
+                bp > ap ||
+                (bp === ap && bt > at)
             ) {
                 result[key] = incoming;
             }
@@ -241,117 +217,218 @@
         return result;
     }
 
-    function favoriteCounts(data) {
-        return {
-            like: (data.like || []).length,
-            book: (data.book || []).length,
-            history: (data.history || []).length,
-            card: (data.card || []).length
-        };
+    function count(favorite, section) {
+        var list = favorite[section];
+
+        return Array.isArray(list)
+            ? list.length
+            : 0;
+    }
+
+    /*
+     * XMLHttpRequest вместо fetch.
+     * Поддерживается старыми LG WebOS.
+     */
+    function requestSync(payload, callback) {
+        var xhr = new XMLHttpRequest();
+        var finished = false;
+
+        function finish(error, data) {
+            if (finished) return;
+
+            finished = true;
+            callback(error, data);
+        }
+
+        try {
+            xhr.open('POST', API, true);
+            xhr.timeout = 15000;
+
+            xhr.setRequestHeader(
+                'Content-Type',
+                'application/json'
+            );
+
+            xhr.onreadystatechange = function () {
+                if (xhr.readyState !== 4) return;
+
+                if (
+                    xhr.status < 200 ||
+                    xhr.status >= 300
+                ) {
+                    finish(
+                        new Error('HTTP ' + xhr.status),
+                        null
+                    );
+                    return;
+                }
+
+                var answer;
+
+                try {
+                    answer = JSON.parse(
+                        xhr.responseText
+                    );
+                } catch (e) {
+                    finish(
+                        new Error('Неверный JSON'),
+                        null
+                    );
+                    return;
+                }
+
+                if (
+                    !answer ||
+                    answer.ok !== true ||
+                    !answer.data ||
+                    typeof answer.data !== 'object'
+                ) {
+                    finish(
+                        new Error(
+                            answer && answer.error
+                                ? answer.error
+                                : 'Неверный ответ сервера'
+                        ),
+                        null
+                    );
+                    return;
+                }
+
+                finish(null, answer.data);
+            };
+
+            xhr.onerror = function () {
+                finish(
+                    new Error('Ошибка сети'),
+                    null
+                );
+            };
+
+            xhr.ontimeout = function () {
+                finish(
+                    new Error('Тайм-аут'),
+                    null
+                );
+            };
+
+            xhr.send(JSON.stringify(payload));
+        } catch (e) {
+            finish(e, null);
+        }
     }
 
     function syncNow(showMessage) {
-        if (busy) {
-            log('Синхронизация уже выполняется');
-            return;
-        }
+        if (busy) return;
 
         var code = getCode();
 
         if (!validCode(code)) {
             if (showMessage) {
-                notify('Сначала введите код');
+                notify('Введите код из 6 цифр');
             }
-
             return;
         }
 
         busy = true;
 
         var outgoing = {
-            favorite: clone(getFavorite()),
-            file_view: clone(storageGet('file_view'))
-        };
-
-        log('Начало синхронизации');
-
-        var controller = typeof AbortController !== 'undefined'
-            ? new AbortController()
-            : null;
-
-        var timeout = setTimeout(function () {
-            if (controller) {
-                controller.abort();
+            code: code,
+            action: 'sync',
+            data: {
+                favorite: clone(getFavorite()),
+                file_view: clone(
+                    getStorage('file_view')
+                )
             }
-        }, 15000);
-
-        var options = {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                code: code,
-                action: 'sync',
-                data: outgoing
-            })
         };
 
-        if (controller) {
-            options.signal = controller.signal;
-        }
+        requestSync(outgoing, function (error, data) {
+            busy = false;
 
-        fetch(API, options)
-            .then(function (response) {
-                if (!response.ok) {
-                    throw new Error(
-                        'HTTP ' + response.status
-                    );
+            if (error) {
+                log('Ошибка:', error.message);
+
+                if (showMessage) {
+                    notify(error.message);
                 }
 
-                return response.json();
-            })
-            .then(function (answer) {
-                if (
-                    !answer ||
-                    answer.ok !== true ||
-                    !answer.data
-                ) {
-                    throw new Error(
-                        answer && answer.error
-                            ? answer.error
-                            : 'Неверный ответ сервера'
-                    );
-                }
+                // При ошибке ничего не перезаписываем.
+                return;
+            }
 
-                // Код мог измениться во время запроса.
-                if (getCode() !== code) {
-                    log('Код изменён, ответ пропущен');
-                    return;
-                }
+            if (getCode() !== code) {
+                log('Код изменился, ответ пропущен');
+                return;
+            }
 
-                // Берём самые свежие локальные данные.
-                var currentFavorite = clone(
+            /*
+             * Защита от неправильной структуры ответа.
+             * Не принимаем пустой/сломанный формат.
+             */
+            if (
+                !data.favorite ||
+                typeof data.favorite !== 'object' ||
+                Array.isArray(data.favorite) ||
+                !data.file_view ||
+                typeof data.file_view !== 'object' ||
+                Array.isArray(data.file_view)
+            ) {
+                log('Некорректная структура данных');
+                return;
+            }
+
+            try {
+                /*
+                 * Перечитываем состояние ПОСЛЕ ответа:
+                 * сохраняем изменения, сделанные
+                 * во время сетевого запроса.
+                 */
+                var localFavorite = clone(
                     getFavorite()
                 );
 
-                var currentProgress = clone(
-                    storageGet('file_view')
+                var localProgress = clone(
+                    getStorage('file_view')
                 );
 
                 var mergedFavorite = mergeFavorites(
-                    currentFavorite,
-                    answer.data.favorite || {}
+                    localFavorite,
+                    data.favorite
                 );
 
                 var mergedProgress = mergeProgress(
-                    currentProgress,
-                    answer.data.file_view || {}
+                    localProgress,
+                    data.file_view
                 );
 
-                // Не перечитываем Favorite без необходимости.
+                /*
+                 * Проверка: локальная история
+                 * не должна уменьшиться.
+                 */
+                var beforeHistory = count(
+                    localFavorite,
+                    'history'
+                );
+
+                var afterHistory = count(
+                    mergedFavorite,
+                    'history'
+                );
+
+                if (afterHistory < beforeHistory) {
+                    log(
+                        'Защита: уменьшение истории',
+                        beforeHistory,
+                        afterHistory
+                    );
+                    return;
+                }
+
+                /*
+                 * Записываем только при изменении.
+                 */
                 if (
-                    JSON.stringify(currentFavorite) !==
+                    JSON.stringify(localFavorite) !==
                     JSON.stringify(mergedFavorite)
                 ) {
                     Lampa.Storage.set(
@@ -365,7 +442,7 @@
                 }
 
                 if (
-                    JSON.stringify(currentProgress) !==
+                    JSON.stringify(localProgress) !==
                     JSON.stringify(mergedProgress)
                 ) {
                     Lampa.Storage.set(
@@ -377,9 +454,22 @@
                 }
 
                 log('OK', {
-                    revision: answer.data.revision,
-                    favorite: favoriteCounts(
-                        mergedFavorite
+                    revision: data.revision,
+                    history: count(
+                        mergedFavorite,
+                        'history'
+                    ),
+                    like: count(
+                        mergedFavorite,
+                        'like'
+                    ),
+                    book: count(
+                        mergedFavorite,
+                        'book'
+                    ),
+                    card: count(
+                        mergedFavorite,
+                        'card'
                     ),
                     progress: Object.keys(
                         mergedProgress
@@ -389,64 +479,49 @@
                 if (showMessage) {
                     notify('Синхронизация выполнена');
                 }
-            })
-            .catch(function (error) {
-                log('Ошибка синхронизации:', error);
+            } catch (e) {
+                log('Ошибка обработки:', e);
 
                 if (showMessage) {
-                    notify(
-                        'Ошибка синхронизации: ' +
-                        error.message
-                    );
+                    notify('Ошибка обработки данных');
                 }
-            })
-            .then(function () {
-                clearTimeout(timeout);
-                busy = false;
-            });
+            }
+        });
     }
 
     function openCodeDialog() {
-        if (codeDialogOpen) {
-            log('Окно ввода уже открыто');
+        if (dialogOpen) return;
+
+        if (
+            !Lampa.Input ||
+            !Lampa.Input.edit
+        ) {
+            notify('Клавиатура недоступна');
             return;
         }
 
-        if (!Lampa.Input || !Lampa.Input.edit) {
-            notify('Ввод кода недоступен');
-            return;
-        }
+        dialogOpen = true;
 
-        codeDialogOpen = true;
-
-        var currentCode = getCode();
-
-        /*
-         * На LG используем минимальный набор
-         * параметров штатного окна Lampa.
-         *
-         * Без принудительного layout: nums
-         * и keyboard: lampa.
-         */
         try {
             Lampa.Input.edit({
                 title: 'Код синхронизации',
-                value: currentCode,
+                value: getCode(),
                 free: true,
                 nosave: true
             }, function (value) {
-                codeDialogOpen = false;
+                dialogOpen = false;
 
-                // Отмена ввода — код не меняем.
-                if (value === null ||
-                    typeof value === 'undefined') {
+                if (
+                    value === null ||
+                    typeof value === 'undefined'
+                ) {
                     return;
                 }
 
                 var code = String(value).trim();
 
                 if (!validCode(code)) {
-                    notify('Введите ровно 6 цифр');
+                    notify('Нужно ровно 6 цифр');
                     return;
                 }
 
@@ -456,54 +531,39 @@
                         code
                     );
                 } catch (e) {
-                    notify('Не удалось сохранить код');
+                    notify('Ошибка сохранения кода');
                     return;
                 }
 
                 notify('Код сохранён');
 
-                /*
-                 * Не запускаем сетевой запрос
-                 * непосредственно внутри callback
-                 * клавиатуры LG.
-                 */
                 setTimeout(function () {
                     syncNow(true);
-                }, 800);
+                }, 1000);
             });
-        } catch (error) {
-            codeDialogOpen = false;
-            log('Ошибка открытия клавиатуры:', error);
-            notify('Не удалось открыть ввод кода');
+        } catch (e) {
+            dialogOpen = false;
+            log('Ошибка клавиатуры:', e);
         }
     }
 
     function installSettings() {
-        if (
-            !Lampa.SettingsApi ||
-            !Lampa.SettingsApi.addParam
-        ) {
-            return;
-        }
-
         Lampa.SettingsApi.addParam({
             component: 'more',
             param: {
-                name: 'lampa_sync_code_v6',
+                name: 'lampa_sync_code_v7',
                 type: 'button'
             },
             field: {
-                name: 'Sync: ввести / изменить код'
+                name: 'Sync: изменить код'
             },
-            onChange: function () {
-                openCodeDialog();
-            }
+            onChange: openCodeDialog
         });
 
         Lampa.SettingsApi.addParam({
             component: 'more',
             param: {
-                name: 'lampa_sync_now_v6',
+                name: 'lampa_sync_now_v7',
                 type: 'button'
             },
             field: {
@@ -521,13 +581,12 @@
         if (
             !window.Lampa ||
             !Lampa.Storage ||
-            !Lampa.Storage.get ||
-            !Lampa.Storage.set ||
             !Lampa.Favorite ||
             !Lampa.Favorite.full ||
             !Lampa.Favorite.read ||
-            !Lampa.Input ||
-            !Lampa.SettingsApi
+            !Lampa.SettingsApi ||
+            !Lampa.SettingsApi.addParam ||
+            !Lampa.Input
         ) {
             return false;
         }
@@ -542,28 +601,31 @@
 
         window.lampaCustomSyncCode = openCodeDialog;
 
-        syncTimer = setInterval(function () {
+        setInterval(function () {
             syncNow(false);
         }, 30000);
 
-        // Только синхронизация, без открытия клавиатуры.
+        /*
+         * Если код сохранён, синхронизируемся.
+         * Клавиатуру автоматически НЕ открываем.
+         */
         if (validCode(getCode())) {
             setTimeout(function () {
                 syncNow(false);
-            }, 2500);
+            }, 3000);
         }
 
-        log('Запущен');
+        log('Запущен. XMLHttpRequest активен.');
         return true;
     }
 
     var attempts = 0;
 
-    var waitTimer = setInterval(function () {
+    var wait = setInterval(function () {
         attempts++;
 
         if (init() || attempts >= 90) {
-            clearInterval(waitTimer);
+            clearInterval(wait);
         }
     }, 1000);
 })();
