@@ -2,6 +2,15 @@
 (function () {
     'use strict';
 
+    if (window.Lampa && Lampa.Manifest) {
+    Lampa.Manifest.plugins = {
+        type: 'other',
+        version: '1.0.0',
+        name: 'Lampa NoAds',
+        description: 'Блокировка рекламы при воспроизведении'
+    };
+}
+
     if (window.noads_experiment_started) return;
     window.noads_experiment_started = true;
 
