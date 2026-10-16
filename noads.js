@@ -14,25 +14,6 @@
     if (window.noads_experiment_started) return;
     window.noads_experiment_started = true;
 
-    function setPluginName() {
-    if (!window.Lampa || !Lampa.Plugins) return;
-
-    var url = 'https://veselkovsergey.github.io/lampa_plugins/noads.js';
-    var plugins = Lampa.Plugins.get();
-
-    var plugin = plugins.find(function (item) {
-        return item.url === url;
-    });
-
-    if (plugin && plugin.name !== 'Lampa NoAds') {
-        plugin.name = 'Lampa NoAds';
-        plugin.author = 'Veselkov Sergey';
-        plugin.descr = 'Блокировка рекламы';
-
-        Lampa.Plugins.save();
-    }
-}
-
     var CLEAR_ALL_TIMERS = false;
     var BLOCK_NEW_VIDEO = true;
 
