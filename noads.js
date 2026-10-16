@@ -2,14 +2,13 @@
 (function () {
     'use strict';
 
-    if (window.noads_plugin_started) return;
-    window.noads_plugin_started = true;
+    if (window.noads_debug_started) return;
+    window.noads_debug_started = true;
 
     function notify(message) {
         console.log('[NoAds] ' + message);
 
-        if (window.Lampa &&
-            Lampa.Noty &&
+        if (window.Lampa && Lampa.Noty &&
             typeof Lampa.Noty.show === 'function') {
             Lampa.Noty.show('NoAds: ' + message);
         }
@@ -18,43 +17,48 @@
     function init() {
         if (!window.Lampa ||
             !Lampa.Player ||
-            !Lampa.Player.listener) {
+            typeof Lampa.Player.play !== 'function') {
             return false;
         }
 
-        Lampa.Player.listener.follow('create', function (event) {
-            notify('Событие запуска плеера');
+        var originalPlay = Lampa.Player.play;
 
-            var data = event && event.data;
-            if (!data) return;
+        Lampa.Player.play = function () {
+            notify('Вызван Player.play');
 
-            if (data.vast_url) {
-                delete data.vast_url;
-                delete data.vast_msg;
-                delete data.vast_region;
-                delete data.vast_platform;
-                delete data.vast_screen;
+            var data = arguments[0];
 
-                notify('VAST удалён');
-            } else {
-                notify('VAST не найден');
+            if (data && typeof data === 'object') {
+                if (data.vast_url) {
+                    delete data.vast_url;
+                    delete data.vast_msg;
+                    delete data.vast_region;
+                    delete data.vast_platform;
+                    delete data.vast_screen;
+
+                    notify('VAST удалён');
+                } else {
+                    notify('VAST отсутствует');
+                }
             }
-        });
 
-        notify('Блокировка подключена');
+            return originalPlay.apply(this, arguments);
+        };
+
+        notify('Перехват Player.play установлен');
         return true;
     }
 
     var attempts = 0;
-
     var timer = setInterval(function () {
         attempts++;
 
-        if (init()) {
+        if (init() || attempts >= 30) {
             clearInterval(timer);
-        } else if (attempts >= 30) {
-            clearInterval(timer);
-            notify('Ошибка инициализации');
+
+            if (attempts >= 30) {
+                notify('Player.play недоступен');
+            }
         }
     }, 1000);
 })();
