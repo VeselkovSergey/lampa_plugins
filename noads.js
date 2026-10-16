@@ -2,8 +2,11 @@
 (function () {
     'use strict';
 
-    if (window.noads_test_started) return;
-    window.noads_test_started = true;
+    if (window.noads_experiment_started) return;
+    window.noads_experiment_started = true;
+
+    var CLEAR_ALL_TIMERS = false;
+    var BLOCK_NEW_VIDEO = true;
 
     function notify(message) {
         console.log('[NoAds] ' + message);
@@ -15,44 +18,74 @@
         }
     }
 
-    function init() {
-        if (!window.Lampa ||
-            !Lampa.Player ||
-            typeof Lampa.Player.play !== 'function') {
-            return false;
-        }
+    // Эксперимент: перехват создания video.
+    // ВНИМАНИЕ: может заблокировать и сам фильм.
+    if (BLOCK_NEW_VIDEO && document.createElement) {
+        var originalCreateElement = document.createElement;
 
-        var originalPlay = Lampa.Player.play;
+        document.createElement = function () {
+            var element = originalCreateElement.apply(this, arguments);
 
-        Lampa.Player.play = function () {
-            var data = arguments[0];
+            if (String(arguments[0]).toLowerCase() === 'video') {
+                var originalPlay = element.play;
 
-            if (data && typeof data === 'object') {
-                // Диагностический обход preroll
-                data.iptv = true;
+                element.play = function () {
+                    notify('Перехвачено воспроизведение video');
 
-                delete data.vast_url;
-                delete data.vast_msg;
+                    // Имитируем завершение.
+                    setTimeout(function () {
+                        element.dispatchEvent(new Event('ended'));
+                    }, 500);
 
-                notify('Тест пропуска рекламы');
+                    return Promise.resolve();
+                };
+
+                element.__noads_original_play = originalPlay;
             }
 
-            return originalPlay.apply(this, arguments);
+            return element;
         };
-
-        notify('Тестовая блокировка подключена');
-        return true;
     }
 
-    var attempts = 0;
-    var timer = setInterval(function () {
-        attempts++;
+    function clearAllTimers() {
+        var lastId = setTimeout(function () {}, 0);
 
-        if (init()) {
-            clearInterval(timer);
-        } else if (attempts >= 30) {
-            clearInterval(timer);
-            notify('Ошибка подключения');
+        for (var i = 0; i <= lastId; i++) {
+            clearTimeout(i);
+            clearInterval(i);
         }
-    }, 1000);
+
+        notify('Таймеры очищены');
+    }
+
+    if (CLEAR_ALL_TIMERS) {
+        if (document.readyState === 'loading') {
+            document.addEventListener(
+                'DOMContentLoaded',
+                clearAllTimers
+            );
+        } else {
+            clearAllTimers();
+        }
+    }
+
+    function ready() {
+        notify('Экспериментальный плагин загружен');
+    }
+
+    if (window.Lampa && Lampa.Noty) {
+        ready();
+    } else {
+        var attempts = 0;
+        var timer = setInterval(function () {
+            attempts++;
+
+            if (window.Lampa && Lampa.Noty) {
+                clearInterval(timer);
+                ready();
+            } else if (attempts >= 30) {
+                clearInterval(timer);
+            }
+        }, 1000);
+    }
 })();
