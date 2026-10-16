@@ -1,57 +1,27 @@
 (function () {
     'use strict';
 
-    function removeAds(item) {
-        if (!item || typeof item !== 'object') return;
+    if (window.noads_plugin_started) return;
+    window.noads_plugin_started = true;
 
-        [
-            'vast_url',
-            'vast_msg',
-            'vast_region',
-            'vast_platform',
-            'vast_screen'
-        ].forEach(function (key) {
-            delete item[key];
-        });
-    }
-
-    function startPlugin() {
-        if (!window.Lampa || !Lampa.Player) return;
-
-        var player = Lampa.Player;
-
-        if (player.__noPrerollInstalled) return;
-        player.__noPrerollInstalled = true;
-
-        if (typeof player.play === 'function') {
-            var originalPlay = player.play;
-
-            player.play = function (data) {
-                removeAds(data);
-                return originalPlay.apply(this, arguments);
-            };
+    function init() {
+        if (!window.Lampa || !Lampa.Player) {
+            console.log('[NoAds] Lampa.Player ещё не готов');
+            return;
         }
 
-        if (typeof player.playlist === 'function') {
-            var originalPlaylist = player.playlist;
+        console.log('[NoAds] Плагин успешно инициализирован');
 
-            player.playlist = function (items) {
-                if (Array.isArray(items)) {
-                    items.forEach(removeAds);
-                }
-
-                return originalPlaylist.apply(this, arguments);
-            };
-        }
-
-        console.log('[NoPreroll] Перехват параметров рекламы включён');
+        // Здесь подключается логика блокировки рекламы.
     }
 
     if (window.appready) {
-        startPlugin();
-    } else if (window.Lampa) {
+        init();
+    } else if (window.Lampa && Lampa.Listener) {
         Lampa.Listener.follow('app', function (event) {
-            if (event.type === 'ready') startPlugin();
+            if (event.type === 'ready') init();
         });
+    } else {
+        console.log('[NoAds] Не найден API Lampa');
     }
 })();
