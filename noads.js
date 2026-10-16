@@ -1,54 +1,43 @@
-
 (function () {
-    'use strict';
+    console.log("Блокировка рекламы активирована");
 
-    function removeVast(data) {
-        if (!data || typeof data !== 'object') return;
+    // Подменяем проверку подписки (премиум аккаунт)
+    window.Account = window.Account || {};
+    window.Account.hasPremium = () => true;
 
-        delete data.vast_url;
-        delete data.vast_msg;
-        delete data.vast_region;
-        delete data.vast_platform;
-        delete data.vast_screen;
+    // Ломаем создание <video> для рекламы
+    document.createElement = new Proxy(document.createElement, {
+        apply(target, thisArg, args) {
+            if (args[0] === "video") {
+                console.log("Перехватываем создание <video> для рекламы!");
+
+                let fakeVideo = target.apply(thisArg, args);
+
+                // Запрещаем рекламе воспроизводиться
+                fakeVideo.play = function () {
+                    console.log("Рекламное видео заблокировано!");
+                    setTimeout(() => {
+                        fakeVideo.ended = true;
+                        fakeVideo.dispatchEvent(new Event("ended")); // Эмулируем завершение рекламы
+                    }, 500);
+                };
+
+                return fakeVideo;
+            }
+            return target.apply(thisArg, args);
+        }
+    });
+
+    // Очищаем таймеры рекламы
+    function clearAdTimers() {
+        console.log("Очищаем рекламные таймеры...");
+        let highestTimeout = setTimeout(() => {}, 0);
+        for (let i = 0; i <= highestTimeout; i++) {
+            clearTimeout(i);
+            clearInterval(i);
+        }
     }
 
-    function startPlugin() {
-        if (window.noads_plugin) return;
-        if (!window.Lampa || !Lampa.Player) return;
-
-        window.noads_plugin = true;
-
-        var player = Lampa.Player;
-
-        if (typeof player.play === 'function') {
-            var originalPlay = player.play;
-
-            player.play = function () {
-                removeVast(arguments[0]);
-                return originalPlay.apply(this, arguments);
-            };
-        }
-
-        if (typeof player.playlist === 'function') {
-            var originalPlaylist = player.playlist;
-
-            player.playlist = function () {
-                var items = arguments[0];
-
-                if (Array.isArray(items)) {
-                    items.forEach(removeVast);
-                } else {
-                    removeVast(items);
-                }
-
-                return originalPlaylist.apply(this, arguments);
-            };
-        }
-
-        console.log('[NoAds] Plugin initialized');
-    }
-
-    // Как в Online MOD: основной запуск сразу
-    startPlugin();
-
+    // Убираем рекламу после загрузки страницы
+    document.addEventListener("DOMContentLoaded", clearAdTimers);
 })();
