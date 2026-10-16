@@ -2,99 +2,143 @@
 (function () {
     'use strict';
 
-    if (window.Lampa && Lampa.Manifest) {
-    Lampa.Manifest.plugins = {
-        type: 'other',
-        version: '1.0.0',
-        name: 'Lampa NoAds',
-        description: 'Блокировка рекламы при воспроизведении'
-    };
-}
+    if (window.lampa_noads_v5) return;
 
-    if (window.noads_experiment_started) return;
-    window.noads_experiment_started = true;
-
-    var CLEAR_ALL_TIMERS = false;
-    var BLOCK_NEW_VIDEO = true;
-
-    function notify(message) {
-        console.log('[NoAds] ' + message);
-
-        if (window.Lampa &&
-            Lampa.Noty &&
-            typeof Lampa.Noty.show === 'function') {
-            Lampa.Noty.show('NoAds: ' + message);
-        }
+    if (
+        !window.Lampa ||
+        !Lampa.Player ||
+        !Lampa.Player.listener ||
+        typeof Lampa.Player.listener.follow !== 'function'
+    ) {
+        console.warn(
+            '[NoAds v5] Lampa.Player.listener недоступен'
+        );
+        return;
     }
 
-    // Эксперимент: перехват создания video.
-    // ВНИМАНИЕ: может заблокировать и сам фильм.
-    if (BLOCK_NEW_VIDEO && document.createElement) {
-        var originalCreateElement = document.createElement;
+    window.lampa_noads_v5 = true;
 
-        document.createElement = function () {
-            var element = originalCreateElement.apply(this, arguments);
+    function beforePlay(event) {
+        var data = event && event.data;
 
-            if (String(arguments[0]).toLowerCase() === 'video') {
-                var originalPlay = element.play;
-
-                element.play = function () {
-                    notify('Перехвачено воспроизведение video');
-
-                    // Имитируем завершение.
-                    setTimeout(function () {
-                        element.dispatchEvent(new Event('ended'));
-                    }, 500);
-
-                    return Promise.resolve();
-                };
-
-                element.__noads_original_play = originalPlay;
-            }
-
-            return element;
-        };
-    }
-
-    function clearAllTimers() {
-        var lastId = setTimeout(function () {}, 0);
-
-        for (var i = 0; i <= lastId; i++) {
-            clearTimeout(i);
-            clearInterval(i);
+        if (!data || typeof data !== 'object') {
+            return;
         }
 
-        notify('Таймеры очищены');
-    }
+        var old;
 
-    if (CLEAR_ALL_TIMERS) {
-        if (document.readyState === 'loading') {
-            document.addEventListener(
-                'DOMContentLoaded',
-                clearAllTimers
+        try {
+            old = Object.getOwnPropertyDescriptor(
+                data,
+                'iptv'
             );
-        } else {
-            clearAllTimers();
+
+            // Не трогаем защищённые свойства
+            // и нестандартные геттеры других плагинов.
+            if (
+                old &&
+                (
+                    !old.configurable ||
+                    !old.hasOwnProperty('value')
+                )
+            ) {
+                return;
+            }
+
+            // Настоящий IPTV уже пропускает рекламу.
+            if (data.iptv) return;
+
+        } catch (e) {
+            return;
+        }
+
+        var reads = 0;
+        var restored = false;
+
+        function restore() {
+            if (restored) return;
+
+            restored = true;
+
+            try {
+                if (old) {
+                    Object.defineProperty(
+                        data,
+                        'iptv',
+                        old
+                    );
+                } else {
+                    delete data.iptv;
+                }
+            } catch (e) {
+                console.warn(
+                    '[NoAds v5] Ошибка восстановления iptv:',
+                    e
+                );
+            }
+        }
+
+        try {
+            /*
+             * В этой сборке Lampa getMediaType()
+             * читает data.iptv два раза:
+             *
+             * 1. При создании поля iptv.
+             * 2. При вычислении поля any.
+             *
+             * На оба чтения возвращаем true.
+             * Сразу после второго восстанавливаем
+             * исходное свойство.
+             */
+
+            Object.defineProperty(data, 'iptv', {
+                configurable: true,
+                enumerable: false,
+
+                get: function () {
+                    reads++;
+
+                    if (reads === 2) {
+                        restore();
+
+                        console.log(
+                            '[NoAds v5] Preroll пропущен'
+                        );
+                    }
+
+                    return true;
+                },
+
+                set: function (value) {
+                    restore();
+                    data.iptv = value;
+                }
+            });
+
+            /*
+             * Защита на случай отменённого
+             * или отложенного запуска фильма.
+             */
+            setTimeout(restore, 0);
+
+        } catch (e) {
+            restore();
+
+            console.warn(
+                '[NoAds v5] Ошибка подготовки:',
+                e
+            );
         }
     }
 
-    function ready() {
-        notify('Экспериментальный плагин загружен');
-    }
+    Lampa.Player.listener.follow(
+        'create',
+        beforePlay
+    );
 
-    if (window.Lampa && Lampa.Noty) {
-        ready();
-    } else {
-        var attempts = 0;
-        var timer = setInterval(function () {
-            attempts++;
+    console.log(
+        '[NoAds v5] Запущен. ' +
+        'Без перехвата XHR и video.play'
+    );
 
-            if (window.Lampa && Lampa.Noty) {
-                clearInterval(timer);
-                ready();
-            } else if (attempts >= 30) {
-                clearInterval(timer);
-            }
-        }, 1000);
-    }
 })();
