@@ -2,31 +2,59 @@
 (function () {
     'use strict';
 
-    console.log('[NoAds] Script executed');
+    if (window.noads_plugin_started) return;
+    window.noads_plugin_started = true;
 
-    function showMessage() {
+    function notify(message) {
+        console.log('[NoAds] ' + message);
+
         if (window.Lampa &&
             Lampa.Noty &&
             typeof Lampa.Noty.show === 'function') {
-            Lampa.Noty.show('NoAds TEST: плагин работает!');
-            console.log('[NoAds] Notification shown');
-        } else {
-            console.log('[NoAds] Notification API unavailable');
+            Lampa.Noty.show('NoAds: ' + message);
         }
     }
 
-    // Проверяем несколько раз, если Lampa ещё загружается
+    function init() {
+        if (!window.Lampa ||
+            !Lampa.Player ||
+            !Lampa.Player.listener) {
+            return false;
+        }
+
+        Lampa.Player.listener.follow('create', function (event) {
+            notify('Событие запуска плеера');
+
+            var data = event && event.data;
+            if (!data) return;
+
+            if (data.vast_url) {
+                delete data.vast_url;
+                delete data.vast_msg;
+                delete data.vast_region;
+                delete data.vast_platform;
+                delete data.vast_screen;
+
+                notify('VAST удалён');
+            } else {
+                notify('VAST не найден');
+            }
+        });
+
+        notify('Блокировка подключена');
+        return true;
+    }
+
     var attempts = 0;
 
     var timer = setInterval(function () {
         attempts++;
 
-        if (window.Lampa && Lampa.Noty) {
+        if (init()) {
             clearInterval(timer);
-            showMessage();
         } else if (attempts >= 30) {
             clearInterval(timer);
-            console.log('[NoAds] Initialization timeout');
+            notify('Ошибка инициализации');
         }
     }, 1000);
 })();
