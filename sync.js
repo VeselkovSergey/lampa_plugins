@@ -2,100 +2,138 @@
 (function () {
     'use strict';
 
-    // Версия 4. Отдельный идентификатор,
-    // чтобы не зависеть от старой версии.
-    if (window.lampa_sync_v4) return;
-    window.lampa_sync_v4 = true;
+    // Новая версия. Старый плагин нужно заменить по тому же URL.
+    if (window.lampa_custom_sync_v5) return;
+    window.lampa_custom_sync_v5 = true;
 
     var API = 'https://lampa.dev-lead.ru/sync.php';
     var KEY = 'lampa_custom_sync_code';
-
     var busy = false;
-    var installed = false;
-    var lastNotice = '';
+    var started = false;
+
+    var SECTIONS = [
+        'like', 'wath', 'book', 'history',
+        'look', 'viewed', 'scheduled',
+        'continued', 'thrown'
+    ];
+
+    function log() {
+        console.log.apply(console, ['[Lampa Sync v5]'].concat(
+            Array.prototype.slice.call(arguments)
+        ));
+    }
 
     function notice(message) {
-        console.log('[Lampa Sync]', message);
+        log(message);
 
-        if (window.Lampa && Lampa.Noty) {
-            if (lastNotice !== message) {
-                Lampa.Noty.show('Sync: ' + message);
-                lastNotice = message;
-            }
+        if (Lampa.Noty && Lampa.Noty.show) {
+            Lampa.Noty.show('Sync: ' + message);
         }
     }
 
-    function read(key) {
+    function storageGet(name) {
         try {
-            return JSON.parse(
-                localStorage.getItem(key) || '{}'
-            );
+            return Lampa.Storage.get(name, {});
         } catch (e) {
+            log('Ошибка чтения', name, e);
             return {};
         }
     }
 
-    function write(key, value) {
-        localStorage.setItem(
-            key,
-            JSON.stringify(value)
-        );
+    function storageSet(name, value) {
+        Lampa.Storage.set(name, value);
     }
 
-    function mergeFavorites(local, remote) {
+    function getFavorite() {
+        try {
+            return Lampa.Favorite.full();
+        } catch (e) {
+            return storageGet('favorite');
+        }
+    }
+
+    function idOf(item, section) {
+        if (section === 'card') {
+            if (!item || typeof item !== 'object' ||
+                item.id == null) return null;
+
+            return String(item.id);
+        }
+
+        if (typeof item !== 'number' &&
+            typeof item !== 'string') return null;
+
+        return String(item);
+    }
+
+    function mergeFavorites(a, b) {
+        a = a || {};
+        b = b || {};
+
         var result = {};
-        var keys = Object.keys(local || {}).concat(
-            Object.keys(remote || {})
-        );
+        var keys = Object.keys(a).concat(Object.keys(b));
+
+        SECTIONS.concat(['card']).forEach(function (key) {
+            if (keys.indexOf(key) === -1) keys.push(key);
+        });
 
         keys.forEach(function (key) {
-            if (result[key]) return;
-
-            var items = []
-                .concat(local[key] || [])
-                .concat(remote[key] || []);
+            var left = Array.isArray(a[key]) ? a[key] : [];
+            var right = Array.isArray(b[key]) ? b[key] : [];
 
             var seen = {};
+            var merged = [];
 
-            result[key] = items.filter(function (item) {
-                if (!item || typeof item !== 'object') {
-                    return false;
-                }
+            left.concat(right).forEach(function (item) {
+                var id = idOf(item, key);
 
-                var id = String(
-                    item.id != null
-                        ? item.id
-                        : JSON.stringify(item)
-                );
-
-                if (seen[id]) return false;
+                if (id === null || seen[id]) return;
 
                 seen[id] = true;
-                return true;
+                merged.push(item);
             });
+
+            result[key] = merged;
         });
 
         return result;
     }
 
-    function mergeProgress(local, remote) {
-        var result = Object.assign({}, local);
+    function mergeProgress(a, b) {
+        a = a && typeof a === 'object' ? a : {};
+        b = b && typeof b === 'object' ? b : {};
 
-        Object.keys(remote || {}).forEach(function (key) {
-            var a = result[key];
-            var b = remote[key];
+        var result = Object.assign({}, a);
 
-            if (!a) {
-                result[key] = b;
+        Object.keys(b).forEach(function (key) {
+            var remote = b[key];
+            var local = result[key];
+
+            if (!remote || typeof remote !== 'object') return;
+
+            if (!local) {
+                result[key] = remote;
                 return;
             }
 
-            if (
-                Number(b.updated || 0) >
-                Number(a.updated || 0)
-            ) {
-                result[key] = b;
+            var remoteUpdated = Number(remote.updated || 0);
+            var localUpdated = Number(local.updated || 0);
+
+            if (remoteUpdated > localUpdated) {
+                result[key] = remote;
             }
+        });
+
+        return result;
+    }
+
+    function counts(f) {
+        var result = {};
+
+        SECTIONS.concat(['card']).forEach(function (key) {
+            result[key] = Array.isArray(f[key])
+                ? f[key].length
+                : 0;
         });
 
         return result;
@@ -104,15 +142,14 @@
     function syncNow() {
         var code = localStorage.getItem(KEY);
 
-        if (!/^\d{6}$/.test(code || '') || busy) {
-            return;
-        }
+        if (!/^\d{6}$/.test(code || '') || busy) return;
 
         busy = true;
 
-        var local = {
-            favorite: read('favorite'),
-            file_view: read('file_view')
+        // Снимок данных перед запросом.
+        var outgoing = {
+            favorite: getFavorite(),
+            file_view: storageGet('file_view')
         };
 
         fetch(API, {
@@ -123,7 +160,7 @@
             body: JSON.stringify({
                 code: code,
                 action: 'sync',
-                data: local
+                data: outgoing
             })
         })
         .then(function (response) {
@@ -133,46 +170,56 @@
 
             return response.json();
         })
-        .then(function (response) {
-            if (!response.ok || !response.data) {
-                throw new Error('Ошибка ответа PHP');
+        .then(function (answer) {
+            if (!answer.ok || !answer.data) {
+                throw new Error('Некорректный ответ сервера');
             }
 
-            var favorites = mergeFavorites(
-                local.favorite,
-                response.data.favorite || {}
+            // ВАЖНО: перечитываем локальные данные ПОСЛЕ
+            // ответа сервера, чтобы не потерять изменения,
+            // сделанные во время сетевого запроса.
+            var currentFavorite = getFavorite();
+            var currentProgress = storageGet('file_view');
+
+            var favorite = mergeFavorites(
+                currentFavorite,
+                answer.data.favorite
             );
 
             var progress = mergeProgress(
-                local.file_view,
-                response.data.file_view || {}
+                currentProgress,
+                answer.data.file_view
             );
 
-            write('favorite', favorites);
-            write('file_view', progress);
+            // Запись через штатный Storage Lampa.
+            storageSet('favorite', favorite);
+            storageSet('file_view', progress);
 
-            console.log('[Lampa Sync] OK');
+            // Обновляем внутреннее состояние Favorite.
+            Lampa.Favorite.read();
+
+            log('Синхронизация OK', {
+                revision: answer.data.revision,
+                favorite: counts(favorite),
+                progress: Object.keys(progress).length
+            });
         })
         .catch(function (error) {
-            console.error('[Lampa Sync]', error);
+            console.error('[Lampa Sync v5]', error);
             notice('Ошибка: ' + error.message);
         })
-        .then(function () {
+        .finally(function () {
             busy = false;
         });
     }
 
     function askCode() {
-        if (!Lampa.Input || !Lampa.Input.edit) {
-            notice('Клавиатура недоступна');
-            return;
-        }
-
         Lampa.Input.edit({
-            title: 'Введите код синхронизации',
+            title: 'Код синхронизации (6 цифр)',
             value: localStorage.getItem(KEY) || '',
             free: true,
             nosave: true,
+            nomic: true,
             layout: 'nums',
             keyboard: 'lampa'
         }, function (value) {
@@ -184,95 +231,81 @@
             }
 
             localStorage.setItem(KEY, code);
-
-            lastNotice = '';
             notice('Код сохранён');
-
             syncNow();
         });
     }
 
     function installSettings() {
-        if (installed) return;
-
-        if (
-            !window.Lampa ||
-            !Lampa.SettingsApi ||
-            !Lampa.SettingsApi.addParam
-        ) {
-            return;
-        }
-
-        installed = true;
+        if (!Lampa.SettingsApi ||
+            !Lampa.SettingsApi.addParam) return;
 
         Lampa.SettingsApi.addParam({
             component: 'more',
             param: {
-                name: 'lampa_sync_code_button',
+                name: 'lampa_custom_sync_code_v5',
                 type: 'button'
             },
             field: {
                 name: 'Ввести / изменить код синхронизации'
             },
-            onChange: function () {
-                askCode();
-            }
+            onChange: askCode
         });
 
         Lampa.SettingsApi.addParam({
             component: 'more',
             param: {
-                name: 'lampa_sync_now_button',
+                name: 'lampa_custom_sync_now_v5',
                 type: 'button'
             },
             field: {
                 name: 'Синхронизировать сейчас'
             },
             onChange: function () {
-                if (!localStorage.getItem(KEY)) {
-                    askCode();
-                } else {
-                    syncNow();
-                    notice('Запрос отправлен');
-                }
+                notice('Синхронизация запущена');
+                syncNow();
             }
         });
-
-        console.log('[Lampa Sync] Кнопки добавлены');
-
-        if (!/^\d{6}$/.test(localStorage.getItem(KEY) || '')) {
-            notice('Откройте Настройки → Ещё → Ввести код');
-        } else {
-            syncNow();
-        }
-
-        setInterval(syncNow, 30000);
     }
 
-    // Публичные функции для диагностики
-    window.lampaSyncAskCode = askCode;
-    window.lampaSyncNow = syncNow;
+    function init() {
+        if (started) return true;
+
+        if (!window.Lampa ||
+            !Lampa.Storage ||
+            !Lampa.Favorite ||
+            !Lampa.Favorite.full ||
+            !Lampa.Favorite.read ||
+            !Lampa.Input) {
+            return false;
+        }
+
+        started = true;
+
+        installSettings();
+
+        window.lampaCustomSyncNow = syncNow;
+        window.lampaCustomSyncCode = askCode;
+
+        setInterval(syncNow, 30000);
+
+        if (localStorage.getItem(KEY)) {
+            syncNow();
+        } else {
+            setTimeout(askCode, 1500);
+        }
+
+        log('Плагин запущен');
+        return true;
+    }
 
     var attempts = 0;
 
-    var wait = setInterval(function () {
+    var timer = setInterval(function () {
         attempts++;
 
-        if (
-            window.Lampa &&
-            Lampa.SettingsApi &&
-            Lampa.Input
-        ) {
-            clearInterval(wait);
-            installSettings();
-        }
-
-        if (attempts >= 60) {
-            clearInterval(wait);
-            console.error(
-                '[Lampa Sync] Не удалось дождаться Lampa'
-            );
+        if (init() || attempts >= 60) {
+            clearInterval(timer);
         }
     }, 1000);
-
 })();
