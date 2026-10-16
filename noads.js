@@ -2,8 +2,19 @@
 (function () {
     'use strict';
 
+    function notify(message) {
+        if (window.Lampa && Lampa.Noty &&
+            typeof Lampa.Noty.show === 'function') {
+            Lampa.Noty.show(message);
+        }
+
+        console.log('[NoAds] ' + message);
+    }
+
     function startPlugin() {
-        if (!window.Lampa || !Lampa.Player || !Lampa.Player.listener) {
+        if (!window.Lampa ||
+            !Lampa.Player ||
+            !Lampa.Player.listener) {
             console.log('[NoAds] Player API unavailable');
             return;
         }
@@ -15,23 +26,29 @@
             var data = event && event.data;
             if (!data) return;
 
+            var hasVast = !!data.vast_url;
+
             delete data.vast_url;
             delete data.vast_msg;
             delete data.vast_region;
             delete data.vast_platform;
             delete data.vast_screen;
 
-            console.log('[NoAds] VAST parameters removed');
+            if (hasVast) {
+                notify('NoAds: VAST-реклама удалена');
+            }
         });
 
-        console.log('[NoAds] Player listener installed');
+        notify('NoAds: плагин успешно загружен');
     }
 
     if (window.appready) {
         startPlugin();
     } else if (window.Lampa && Lampa.Listener) {
         Lampa.Listener.follow('app', function (event) {
-            if (event.type === 'ready') startPlugin();
+            if (event.type === 'ready') {
+                startPlugin();
+            }
         });
     }
 
