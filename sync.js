@@ -2,35 +2,36 @@
 (function () {
     'use strict';
 
-    if (window.lampa_file_sync) return;
-    window.lampa_file_sync = true;
+    // Версия 4. Отдельный идентификатор,
+    // чтобы не зависеть от старой версии.
+    if (window.lampa_sync_v4) return;
+    window.lampa_sync_v4 = true;
 
     var API = 'https://lampa.dev-lead.ru/sync.php';
     var KEY = 'lampa_custom_sync_code';
 
     var busy = false;
-    var started = false;
-    var asking = false;
+    var installed = false;
+    var lastNotice = '';
 
-    function notice(msg) {
-        console.log('[Sync]', msg);
+    function notice(message) {
+        console.log('[Lampa Sync]', message);
 
-        if (
-            window.Lampa &&
-            Lampa.Noty &&
-            Lampa.Noty.show
-        ) {
-            Lampa.Noty.show('Sync: ' + msg);
+        if (window.Lampa && Lampa.Noty) {
+            if (lastNotice !== message) {
+                Lampa.Noty.show('Sync: ' + message);
+                lastNotice = message;
+            }
         }
     }
 
-    function read(key, fallback) {
+    function read(key) {
         try {
             return JSON.parse(
-                localStorage.getItem(key)
-            ) || fallback;
+                localStorage.getItem(key) || '{}'
+            );
         } catch (e) {
-            return fallback;
+            return {};
         }
     }
 
@@ -41,87 +42,77 @@
         );
     }
 
-    function itemId(item) {
-        if (item && item.id != null) {
-            return String(item.id);
-        }
-
-        return JSON.stringify(item);
-    }
-
-    function mergeFavorites(a, b) {
+    function mergeFavorites(local, remote) {
         var result = {};
-
-        var keys = Object.keys(a || {}).concat(
-            Object.keys(b || {})
+        var keys = Object.keys(local || {}).concat(
+            Object.keys(remote || {})
         );
 
         keys.forEach(function (key) {
             if (result[key]) return;
 
+            var items = []
+                .concat(local[key] || [])
+                .concat(remote[key] || []);
+
             var seen = {};
-            var out = [];
 
-            var left = Array.isArray(a && a[key])
-                ? a[key]
-                : [];
-
-            var right = Array.isArray(b && b[key])
-                ? b[key]
-                : [];
-
-            left.concat(right).forEach(function (item) {
+            result[key] = items.filter(function (item) {
                 if (!item || typeof item !== 'object') {
-                    return;
+                    return false;
                 }
 
-                var id = itemId(item);
+                var id = String(
+                    item.id != null
+                        ? item.id
+                        : JSON.stringify(item)
+                );
 
-                if (!seen[id]) {
-                    seen[id] = true;
-                    out.push(item);
-                }
+                if (seen[id]) return false;
+
+                seen[id] = true;
+                return true;
             });
-
-            result[key] = out;
         });
 
         return result;
     }
 
-    function mergeProgress(a, b) {
-        var result = Object.assign({}, a || {});
+    function mergeProgress(local, remote) {
+        var result = Object.assign({}, local);
 
-        Object.keys(b || {}).forEach(function (key) {
-            var remote = b[key];
-            var local = result[key];
+        Object.keys(remote || {}).forEach(function (key) {
+            var a = result[key];
+            var b = remote[key];
 
-            if (!remote || typeof remote !== 'object') {
+            if (!a) {
+                result[key] = b;
                 return;
             }
 
             if (
-                !local ||
-                Number(remote.updated || 0) >
-                Number(local.updated || 0)
+                Number(b.updated || 0) >
+                Number(a.updated || 0)
             ) {
-                result[key] = remote;
+                result[key] = b;
             }
         });
 
         return result;
     }
 
-    function sync() {
+    function syncNow() {
         var code = localStorage.getItem(KEY);
 
-        if (!code || busy) return;
+        if (!/^\d{6}$/.test(code || '') || busy) {
+            return;
+        }
 
         busy = true;
 
         var local = {
-            favorite: read('favorite', {}),
-            file_view: read('file_view', {})
+            favorite: read('favorite'),
+            file_view: read('file_view')
         };
 
         fetch(API, {
@@ -137,130 +128,150 @@
         })
         .then(function (response) {
             if (!response.ok) {
-                throw new Error(
-                    'HTTP ' + response.status
-                );
+                throw new Error('HTTP ' + response.status);
             }
 
             return response.json();
         })
-        .then(function (answer) {
-            if (!answer.ok || !answer.data) {
-                throw new Error(
-                    'Некорректный ответ сервера'
-                );
+        .then(function (response) {
+            if (!response.ok || !response.data) {
+                throw new Error('Ошибка ответа PHP');
             }
 
-            var mergedFavorite = mergeFavorites(
+            var favorites = mergeFavorites(
                 local.favorite,
-                answer.data.favorite
+                response.data.favorite || {}
             );
 
-            var mergedProgress = mergeProgress(
+            var progress = mergeProgress(
                 local.file_view,
-                answer.data.file_view
+                response.data.file_view || {}
             );
 
-            write('favorite', mergedFavorite);
-            write('file_view', mergedProgress);
+            write('favorite', favorites);
+            write('file_view', progress);
 
-            console.log(
-                '[Sync] Синхронизация выполнена'
-            );
+            console.log('[Lampa Sync] OK');
         })
         .catch(function (error) {
-            console.error('[Sync]', error);
-
-            notice(
-                'Ошибка синхронизации: ' +
-                error.message
-            );
+            console.error('[Lampa Sync]', error);
+            notice('Ошибка: ' + error.message);
         })
-        .finally(function () {
+        .then(function () {
             busy = false;
         });
     }
 
     function askCode() {
-        if (asking) return;
-
-        if (
-            !window.Lampa ||
-            !Lampa.Input ||
-            !Lampa.Input.edit
-        ) {
-            notice('Ввод кода недоступен');
+        if (!Lampa.Input || !Lampa.Input.edit) {
+            notice('Клавиатура недоступна');
             return;
         }
 
-        asking = true;
-
         Lampa.Input.edit({
-            title: 'Код синхронизации (6 цифр)',
-            value: '',
+            title: 'Введите код синхронизации',
+            value: localStorage.getItem(KEY) || '',
             free: true,
             nosave: true,
-            nomic: true,
             layout: 'nums',
             keyboard: 'lampa'
         }, function (value) {
-            asking = false;
-
             var code = String(value || '').trim();
 
             if (!/^\d{6}$/.test(code)) {
-                notice(
-                    'Код должен содержать 6 цифр'
-                );
+                notice('Нужно ровно 6 цифр');
                 return;
             }
 
             localStorage.setItem(KEY, code);
 
-            notice('Профиль подключён');
+            lastNotice = '';
+            notice('Код сохранён');
 
-            sync();
+            syncNow();
         });
     }
 
-    function init() {
+    function installSettings() {
+        if (installed) return;
+
         if (
             !window.Lampa ||
-            !Lampa.Noty ||
-            !Lampa.Input
+            !Lampa.SettingsApi ||
+            !Lampa.SettingsApi.addParam
         ) {
-            return false;
+            return;
         }
 
-        if (started) return true;
+        installed = true;
 
-        started = true;
+        Lampa.SettingsApi.addParam({
+            component: 'more',
+            param: {
+                name: 'lampa_sync_code_button',
+                type: 'button'
+            },
+            field: {
+                name: 'Ввести / изменить код синхронизации'
+            },
+            onChange: function () {
+                askCode();
+            }
+        });
 
-        // Синхронизация каждые 30 секунд
-        setInterval(sync, 30000);
+        Lampa.SettingsApi.addParam({
+            component: 'more',
+            param: {
+                name: 'lampa_sync_now_button',
+                type: 'button'
+            },
+            field: {
+                name: 'Синхронизировать сейчас'
+            },
+            onChange: function () {
+                if (!localStorage.getItem(KEY)) {
+                    askCode();
+                } else {
+                    syncNow();
+                    notice('Запрос отправлен');
+                }
+            }
+        });
 
-        var code = localStorage.getItem(KEY);
+        console.log('[Lampa Sync] Кнопки добавлены');
 
-        if (code && /^\d{6}$/.test(code)) {
-            notice('Профиль подключён');
-            sync();
+        if (!/^\d{6}$/.test(localStorage.getItem(KEY) || '')) {
+            notice('Откройте Настройки → Ещё → Ввести код');
         } else {
-            // Ждём загрузки интерфейса телевизора
-            setTimeout(askCode, 1500);
+            syncNow();
         }
 
-        return true;
+        setInterval(syncNow, 30000);
     }
 
-    // Ручной вызов окна ввода кода
-    window.lampaFileSyncAskCode = askCode;
+    // Публичные функции для диагностики
+    window.lampaSyncAskCode = askCode;
+    window.lampaSyncNow = syncNow;
 
-    // Ожидание готовности Lampa
     var attempts = 0;
 
-    var timer = setInterval(function () {
-        if (init() || ++attempts > 30) {
-            clearInterval(timer);
+    var wait = setInterval(function () {
+        attempts++;
+
+        if (
+            window.Lampa &&
+            Lampa.SettingsApi &&
+            Lampa.Input
+        ) {
+            clearInterval(wait);
+            installSettings();
+        }
+
+        if (attempts >= 60) {
+            clearInterval(wait);
+            console.error(
+                '[Lampa Sync] Не удалось дождаться Lampa'
+            );
         }
     }, 1000);
 
