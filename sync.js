@@ -2,6 +2,15 @@
 (function () {
     'use strict';
 
+    if (window.Lampa && Lampa.Manifest) {
+    Lampa.Manifest.plugins = {
+        type: 'other',
+        version: '7.0.0',
+        name: 'Lampa Sync',
+        description: 'Синхронизация избранного, истории и прогресса просмотра'
+    };
+}
+
     if (window.lampa_custom_sync_v7) return;
     window.lampa_custom_sync_v7 = true;
 
