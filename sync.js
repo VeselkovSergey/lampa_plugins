@@ -7,26 +7,38 @@
 
     var API = 'https://lampa.dev-lead.ru/sync.php';
     var KEY = 'lampa_custom_sync_code';
+
     var busy = false;
+    var started = false;
+    var asking = false;
 
     function notice(msg) {
         console.log('[Sync]', msg);
 
-        if (window.Lampa && Lampa.Noty && Lampa.Noty.show) {
+        if (
+            window.Lampa &&
+            Lampa.Noty &&
+            Lampa.Noty.show
+        ) {
             Lampa.Noty.show('Sync: ' + msg);
         }
     }
 
     function read(key, fallback) {
         try {
-            return JSON.parse(localStorage.getItem(key)) || fallback;
+            return JSON.parse(
+                localStorage.getItem(key)
+            ) || fallback;
         } catch (e) {
             return fallback;
         }
     }
 
     function write(key, value) {
-        localStorage.setItem(key, JSON.stringify(value));
+        localStorage.setItem(
+            key,
+            JSON.stringify(value)
+        );
     }
 
     function itemId(item) {
@@ -39,6 +51,7 @@
 
     function mergeFavorites(a, b) {
         var result = {};
+
         var keys = Object.keys(a || {}).concat(
             Object.keys(b || {})
         );
@@ -58,7 +71,9 @@
                 : [];
 
             left.concat(right).forEach(function (item) {
-                if (!item || typeof item !== 'object') return;
+                if (!item || typeof item !== 'object') {
+                    return;
+                }
 
                 var id = itemId(item);
 
@@ -85,9 +100,11 @@
                 return;
             }
 
-            if (!local ||
+            if (
+                !local ||
                 Number(remote.updated || 0) >
-                Number(local.updated || 0)) {
+                Number(local.updated || 0)
+            ) {
                 result[key] = remote;
             }
         });
@@ -120,14 +137,18 @@
         })
         .then(function (response) {
             if (!response.ok) {
-                throw new Error('HTTP ' + response.status);
+                throw new Error(
+                    'HTTP ' + response.status
+                );
             }
 
             return response.json();
         })
         .then(function (answer) {
             if (!answer.ok || !answer.data) {
-                throw new Error('Некорректный ответ');
+                throw new Error(
+                    'Некорректный ответ сервера'
+                );
             }
 
             var mergedFavorite = mergeFavorites(
@@ -143,7 +164,9 @@
             write('favorite', mergedFavorite);
             write('file_view', mergedProgress);
 
-            console.log('[Sync] Синхронизация выполнена');
+            console.log(
+                '[Sync] Синхронизация выполнена'
+            );
         })
         .catch(function (error) {
             console.error('[Sync]', error);
@@ -158,35 +181,81 @@
         });
     }
 
-    function init() {
-        if (!window.Lampa || !Lampa.Noty) {
-            return false;
+    function askCode() {
+        if (asking) return;
+
+        if (
+            !window.Lampa ||
+            !Lampa.Input ||
+            !Lampa.Input.edit
+        ) {
+            notice('Ввод кода недоступен');
+            return;
         }
 
-        var code = localStorage.getItem(KEY);
+        asking = true;
 
-        if (!code) {
-            code = prompt(
-                'Sync: введи 6 цифр профиля ' +
-                '(одинаковые на ПК и ТВ)'
-            );
+        Lampa.Input.edit({
+            title: 'Код синхронизации (6 цифр)',
+            value: '',
+            free: true,
+            nosave: true,
+            nomic: true,
+            layout: 'nums',
+            keyboard: 'lampa'
+        }, function (value) {
+            asking = false;
 
-            if (!code || !/^\d{6}$/.test(code)) {
-                notice('Код не задан');
-                return true;
+            var code = String(value || '').trim();
+
+            if (!/^\d{6}$/.test(code)) {
+                notice(
+                    'Код должен содержать 6 цифр'
+                );
+                return;
             }
 
             localStorage.setItem(KEY, code);
+
+            notice('Профиль подключён');
+
+            sync();
+        });
+    }
+
+    function init() {
+        if (
+            !window.Lampa ||
+            !Lampa.Noty ||
+            !Lampa.Input
+        ) {
+            return false;
         }
 
-        notice('Профиль подключён');
+        if (started) return true;
 
-        sync();
+        started = true;
+
+        // Синхронизация каждые 30 секунд
         setInterval(sync, 30000);
+
+        var code = localStorage.getItem(KEY);
+
+        if (code && /^\d{6}$/.test(code)) {
+            notice('Профиль подключён');
+            sync();
+        } else {
+            // Ждём загрузки интерфейса телевизора
+            setTimeout(askCode, 1500);
+        }
 
         return true;
     }
 
+    // Ручной вызов окна ввода кода
+    window.lampaFileSyncAskCode = askCode;
+
+    // Ожидание готовности Lampa
     var attempts = 0;
 
     var timer = setInterval(function () {
@@ -194,4 +263,5 @@
             clearInterval(timer);
         }
     }, 1000);
+
 })();
