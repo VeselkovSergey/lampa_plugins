@@ -2,261 +2,99 @@
 (function () {
     'use strict';
 
-    if (window.noads_direct_v3) return;
-    window.noads_direct_v3 = true;
+    if (window.Lampa && Lampa.Manifest) {
+    Lampa.Manifest.plugins = {
+        type: 'other',
+        version: '1.0.0',
+        name: 'Lampa NoAds',
+        description: 'Блокировка рекламы при воспроизведении'
+    };
+}
 
-    var NativeXHR = window.XMLHttpRequest;
-    var blocked = 0;
+    if (window.noads_experiment_started) return;
+    window.noads_experiment_started = true;
 
-    function log(message) {
-        console.log('[NoAds v3] ' + message);
+    var CLEAR_ALL_TIMERS = false;
+    var BLOCK_NEW_VIDEO = true;
+
+    function notify(message) {
+        console.log('[NoAds] ' + message);
+
+        if (window.Lampa &&
+            Lampa.Noty &&
+            typeof Lampa.Noty.show === 'function') {
+            Lampa.Noty.show('NoAds: ' + message);
+        }
     }
 
-    function isPreroll(url) {
-        return /\/api\/ad\/get\/preroll(?:[?#]|$)/i.test(
-            String(url || '')
-        );
-    }
+    // Эксперимент: перехват создания video.
+    // ВНИМАНИЕ: может заблокировать и сам фильм.
+    if (BLOCK_NEW_VIDEO && document.createElement) {
+        var originalCreateElement = document.createElement;
 
-    function FakePrerollXHR() {
-        this.readyState = 0;
-        this.status = 0;
-        this.statusText = '';
-        this.responseText = '';
-        this.response = null;
+        document.createElement = function () {
+            var element = originalCreateElement.apply(this, arguments);
 
-        this.onload = null;
-        this.onreadystatechange = null;
-        this.onerror = null;
-        this.ontimeout = null;
-        this.onloadend = null;
+            if (String(arguments[0]).toLowerCase() === 'video') {
+                var originalPlay = element.play;
 
-        this.timeout = 0;
-        this.withCredentials = false;
+                element.play = function () {
+                    notify('Перехвачено воспроизведение video');
 
-        this._listeners = {};
-        this._timer = null;
-    }
+                    // Имитируем завершение.
+                    setTimeout(function () {
+                        element.dispatchEvent(new Event('ended'));
+                    }, 500);
 
-    FakePrerollXHR.prototype.addEventListener = function (
-        type,
-        callback
-    ) {
-        if (typeof callback !== 'function') return;
-
-        if (!this._listeners[type]) {
-            this._listeners[type] = [];
-        }
-
-        this._listeners[type].push(callback);
-    };
-
-    FakePrerollXHR.prototype.removeEventListener = function (
-        type,
-        callback
-    ) {
-        var listeners = this._listeners[type];
-
-        if (!listeners) return;
-
-        var index = listeners.indexOf(callback);
-
-        if (index !== -1) {
-            listeners.splice(index, 1);
-        }
-    };
-
-    FakePrerollXHR.prototype._emit = function (type) {
-        var event = {
-            type: type,
-            target: this,
-            currentTarget: this
-        };
-
-        var handler = this['on' + type];
-
-        if (typeof handler === 'function') {
-            try {
-                handler.call(this, event);
-            } catch (e) {
-                log('Ошибка обработчика ' + type + ': ' + e);
-            }
-        }
-
-        var listeners = (
-            this._listeners[type] || []
-        ).slice();
-
-        for (var i = 0; i < listeners.length; i++) {
-            try {
-                listeners[i].call(this, event);
-            } catch (e) {
-                log('Ошибка слушателя ' + type + ': ' + e);
-            }
-        }
-    };
-
-    FakePrerollXHR.prototype.open = function () {
-        this.readyState = 1;
-        this._emit('readystatechange');
-    };
-
-    FakePrerollXHR.prototype.setRequestHeader = function () {};
-
-    FakePrerollXHR.prototype.getResponseHeader = function (
-        name
-    ) {
-        if (String(name).toLowerCase() === 'content-type') {
-            return 'application/json';
-        }
-
-        return null;
-    };
-
-    FakePrerollXHR.prototype.getAllResponseHeaders = function () {
-        return 'content-type: application/json\r\n';
-    };
-
-    FakePrerollXHR.prototype.overrideMimeType = function () {};
-
-    FakePrerollXHR.prototype.send = function () {
-        var self = this;
-
-        this._timer = setTimeout(function () {
-            self._timer = null;
-
-            self.status = 200;
-            self.statusText = 'OK';
-            self.responseText = '{"ad":[]}';
-            self.response = self.responseText;
-            self.readyState = 4;
-
-            self._emit('readystatechange');
-            self._emit('load');
-            self._emit('loadend');
-
-            blocked++;
-            log(
-                'Preroll отключён. Запросов: ' + blocked
-            );
-        }, 0);
-    };
-
-    FakePrerollXHR.prototype.abort = function () {
-        if (this._timer !== null) {
-            clearTimeout(this._timer);
-            this._timer = null;
-        }
-
-        this.readyState = 0;
-        this._emit('abort');
-        this._emit('loadend');
-    };
-
-    /*
-     * Для обычных запросов возвращаем настоящий XHR.
-     * Для preroll создаём объект с ответом {"ad":[]}.
-     */
-    function NoAdsXHR() {
-        var xhr = new NativeXHR();
-        var originalOpen = xhr.open;
-        var fake = null;
-
-        xhr.open = function (method, url) {
-            if (
-                String(method).toUpperCase() === 'GET' &&
-                isPreroll(url)
-            ) {
-                /*
-                 * Перехват должен произойти до установки
-                 * обработчиков onload в VastManager.
-                 */
-                fake = new FakePrerollXHR();
-                fake.open();
-
-                log('Запрос рекламы перехвачен: ' + url);
-
-                return;
-            }
-
-            return originalOpen.apply(xhr, arguments);
-        };
-
-        /*
-         * Возвращаем обёртку с прозрачным доступом
-         * к обычному XHR и отдельной обработкой preroll.
-         */
-        var wrapper = {};
-
-        var properties = [
-            'onload',
-            'onreadystatechange',
-            'onerror',
-            'ontimeout',
-            'onloadend',
-            'onabort',
-            'timeout',
-            'withCredentials',
-            'responseType',
-            'readyState',
-            'status',
-            'statusText',
-            'responseText',
-            'response',
-            'upload'
-        ];
-
-        for (var i = 0; i < properties.length; i++) {
-            (function (property) {
-                Object.defineProperty(wrapper, property, {
-                    configurable: true,
-                    enumerable: true,
-
-                    get: function () {
-                        return (fake || xhr)[property];
-                    },
-
-                    set: function (value) {
-                        (fake || xhr)[property] = value;
-                    }
-                });
-            })(properties[i]);
-        }
-
-        wrapper.open = function () {
-            return xhr.open.apply(xhr, arguments);
-        };
-
-        var methods = [
-            'send',
-            'abort',
-            'setRequestHeader',
-            'getResponseHeader',
-            'getAllResponseHeaders',
-            'overrideMimeType',
-            'addEventListener',
-            'removeEventListener'
-        ];
-
-        for (var j = 0; j < methods.length; j++) {
-            (function (method) {
-                wrapper[method] = function () {
-                    var target = fake || xhr;
-
-                    return target[method].apply(
-                        target,
-                        arguments
-                    );
+                    return Promise.resolve();
                 };
-            })(methods[j]);
-        }
 
-        return wrapper;
+                element.__noads_original_play = originalPlay;
+            }
+
+            return element;
+        };
     }
 
-    NoAdsXHR.prototype = NativeXHR.prototype;
+    function clearAllTimers() {
+        var lastId = setTimeout(function () {}, 0);
 
-    window.XMLHttpRequest = NoAdsXHR;
+        for (var i = 0; i <= lastId; i++) {
+            clearTimeout(i);
+            clearInterval(i);
+        }
 
-    log('Запущен. Прямой перехват preroll активен.');
+        notify('Таймеры очищены');
+    }
+
+    if (CLEAR_ALL_TIMERS) {
+        if (document.readyState === 'loading') {
+            document.addEventListener(
+                'DOMContentLoaded',
+                clearAllTimers
+            );
+        } else {
+            clearAllTimers();
+        }
+    }
+
+    function ready() {
+        notify('Экспериментальный плагин загружен');
+    }
+
+    if (window.Lampa && Lampa.Noty) {
+        ready();
+    } else {
+        var attempts = 0;
+        var timer = setInterval(function () {
+            attempts++;
+
+            if (window.Lampa && Lampa.Noty) {
+                clearInterval(timer);
+                ready();
+            } else if (attempts >= 30) {
+                clearInterval(timer);
+            }
+        }, 1000);
+    }
 })();
