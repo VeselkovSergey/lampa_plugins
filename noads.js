@@ -2,13 +2,14 @@
 (function () {
     'use strict';
 
-    if (window.noads_debug_started) return;
-    window.noads_debug_started = true;
+    if (window.noads_test_started) return;
+    window.noads_test_started = true;
 
     function notify(message) {
         console.log('[NoAds] ' + message);
 
-        if (window.Lampa && Lampa.Noty &&
+        if (window.Lampa &&
+            Lampa.Noty &&
             typeof Lampa.Noty.show === 'function') {
             Lampa.Noty.show('NoAds: ' + message);
         }
@@ -24,28 +25,22 @@
         var originalPlay = Lampa.Player.play;
 
         Lampa.Player.play = function () {
-            notify('Вызван Player.play');
-
             var data = arguments[0];
 
             if (data && typeof data === 'object') {
-                if (data.vast_url) {
-                    delete data.vast_url;
-                    delete data.vast_msg;
-                    delete data.vast_region;
-                    delete data.vast_platform;
-                    delete data.vast_screen;
+                // Диагностический обход preroll
+                data.iptv = true;
 
-                    notify('VAST удалён');
-                } else {
-                    notify('VAST отсутствует');
-                }
+                delete data.vast_url;
+                delete data.vast_msg;
+
+                notify('Тест пропуска рекламы');
             }
 
             return originalPlay.apply(this, arguments);
         };
 
-        notify('Перехват Player.play установлен');
+        notify('Тестовая блокировка подключена');
         return true;
     }
 
@@ -53,12 +48,11 @@
     var timer = setInterval(function () {
         attempts++;
 
-        if (init() || attempts >= 30) {
+        if (init()) {
             clearInterval(timer);
-
-            if (attempts >= 30) {
-                notify('Player.play недоступен');
-            }
+        } else if (attempts >= 30) {
+            clearInterval(timer);
+            notify('Ошибка подключения');
         }
     }, 1000);
 })();
