@@ -2,24 +2,19 @@
 (function () {
     'use strict';
 
-    if (window.Lampa && Lampa.Manifest) {
-    Lampa.Manifest.plugins = {
-        type: 'other',
-        version: '7.0.0',
-        name: 'Lampa Sync',
-        description: 'Синхронизация избранного, истории и прогресса просмотра'
-    };
-}
-
-    if (window.lampa_custom_sync_v7) return;
-    window.lampa_custom_sync_v7 = true;
+    if (window.lampa_custom_sync_v8) return;
+    window.lampa_custom_sync_v8 = true;
 
     var API = 'https://lampa.dev-lead.ru/sync.php';
     var CODE_KEY = 'lampa_custom_sync_code';
 
-    var busy = false;
     var started = false;
+    var busy = false;
+    var pending = false;
+    var applying = false;
     var dialogOpen = false;
+    var debounceTimer = null;
+    var lastNavigationSync = 0;
 
     var SECTIONS = [
         'like', 'wath', 'book', 'card',
@@ -28,7 +23,7 @@
     ];
 
     function log() {
-        var args = ['[Lampa Sync v7]'];
+        var args = ['[Lampa Sync v8]'];
 
         for (var i = 0; i < arguments.length; i++) {
             args.push(arguments[i]);
@@ -77,7 +72,7 @@
                 return value;
             }
         } catch (e) {
-            log('Storage.get error:', name, e);
+            log('Ошибка чтения:', name, e);
         }
 
         return {};
@@ -85,10 +80,16 @@
 
     function getFavorite() {
         try {
-            return Lampa.Favorite.full();
+            var value = Lampa.Favorite.full();
+
+            if (value && typeof value === 'object') {
+                return value;
+            }
         } catch (e) {
-            return getStorage('favorite');
+            log('Favorite.full:', e);
         }
+
+        return getStorage('favorite');
     }
 
     function itemId(item, section) {
@@ -114,11 +115,6 @@
         return String(item);
     }
 
-    /*
-     * Только объединение.
-     * Отсутствие фильма на другом устройстве
-     * НЕ означает удаление.
-     */
     function mergeFavorites(local, remote) {
         local = local || {};
         remote = remote || {};
@@ -211,7 +207,6 @@
 
             var ap = Number(current.percent || 0);
             var bp = Number(incoming.percent || 0);
-
             var at = Number(current.time || 0);
             var bt = Number(incoming.time || 0);
 
@@ -226,18 +221,64 @@
         return result;
     }
 
-    function count(favorite, section) {
-        var list = favorite[section];
+    /*
+     * Сравниваем состав списков, а не порядок.
+     * Это предотвращает лишние Favorite.read().
+     */
+    function favoriteCompositionChanged(a, b) {
+        var keys = SECTIONS.slice();
 
-        return Array.isArray(list)
-            ? list.length
+        Object.keys(a || {}).concat(
+            Object.keys(b || {})
+        ).forEach(function (key) {
+            if (keys.indexOf(key) === -1) {
+                keys.push(key);
+            }
+        });
+
+        for (var i = 0; i < keys.length; i++) {
+            var section = keys[i];
+
+            var left = Array.isArray(a[section])
+                ? a[section]
+                : [];
+
+            var right = Array.isArray(b[section])
+                ? b[section]
+                : [];
+
+            if (left.length !== right.length) {
+                return true;
+            }
+
+            var ids = Object.create(null);
+
+            left.forEach(function (item) {
+                var id = itemId(item, section);
+
+                if (id !== null) {
+                    ids['id:' + id] = true;
+                }
+            });
+
+            for (var j = 0; j < right.length; j++) {
+                var id = itemId(right[j], section);
+
+                if (id === null || !ids['id:' + id]) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    function count(favorite, section) {
+        return Array.isArray(favorite[section])
+            ? favorite[section].length
             : 0;
     }
 
-    /*
-     * XMLHttpRequest вместо fetch.
-     * Поддерживается старыми LG WebOS.
-     */
     function requestSync(payload, callback) {
         var xhr = new XMLHttpRequest();
         var finished = false;
@@ -327,20 +368,24 @@
     }
 
     function syncNow(showMessage) {
-        if (busy) return;
-
         var code = getCode();
 
         if (!validCode(code)) {
             if (showMessage) {
                 notify('Введите код из 6 цифр');
             }
+
+            return;
+        }
+
+        if (busy) {
+            pending = true;
             return;
         }
 
         busy = true;
 
-        var outgoing = {
+        var payload = {
             code: code,
             action: 'sync',
             data: {
@@ -351,7 +396,7 @@
             }
         };
 
-        requestSync(outgoing, function (error, data) {
+        requestSync(payload, function (error, data) {
             busy = false;
 
             if (error) {
@@ -361,7 +406,6 @@
                     notify(error.message);
                 }
 
-                // При ошибке ничего не перезаписываем.
                 return;
             }
 
@@ -370,10 +414,6 @@
                 return;
             }
 
-            /*
-             * Защита от неправильной структуры ответа.
-             * Не принимаем пустой/сломанный формат.
-             */
             if (
                 !data.favorite ||
                 typeof data.favorite !== 'object' ||
@@ -382,16 +422,13 @@
                 typeof data.file_view !== 'object' ||
                 Array.isArray(data.file_view)
             ) {
-                log('Некорректная структура данных');
+                log('Неверная структура ответа');
                 return;
             }
 
             try {
-                /*
-                 * Перечитываем состояние ПОСЛЕ ответа:
-                 * сохраняем изменения, сделанные
-                 * во время сетевого запроса.
-                 */
+                applying = true;
+
                 var localFavorite = clone(
                     getFavorite()
                 );
@@ -410,44 +447,48 @@
                     data.file_view
                 );
 
+                var favoriteChanged =
+                    favoriteCompositionChanged(
+                        localFavorite,
+                        mergedFavorite
+                    );
+
                 /*
-                 * Проверка: локальная история
-                 * не должна уменьшиться.
+                 * Проверяем, что объединение
+                 * не потеряло локальные ID.
                  */
-                var beforeHistory = count(
+                var historyBefore = count(
                     localFavorite,
                     'history'
                 );
 
-                var afterHistory = count(
+                var historyAfter = count(
                     mergedFavorite,
                     'history'
                 );
 
-                if (afterHistory < beforeHistory) {
-                    log(
-                        'Защита: уменьшение истории',
-                        beforeHistory,
-                        afterHistory
+                if (historyAfter < historyBefore) {
+                    throw new Error(
+                        'Защита истории: количество уменьшилось'
                     );
-                    return;
                 }
 
-                /*
-                 * Записываем только при изменении.
-                 */
-                if (
-                    JSON.stringify(localFavorite) !==
-                    JSON.stringify(mergedFavorite)
-                ) {
+                if (favoriteChanged) {
                     Lampa.Storage.set(
                         'favorite',
-                        mergedFavorite
+                        mergedFavorite,
+                        true
                     );
 
+                    /*
+                     * Только если реально появились
+                     * новые элементы.
+                     *
+                     * Lampa сама обновит активность.
+                     */
                     Lampa.Favorite.read();
 
-                    log('Избранное обновлено');
+                    log('Обновлены списки избранного');
                 }
 
                 if (
@@ -456,10 +497,11 @@
                 ) {
                     Lampa.Storage.set(
                         'file_view',
-                        mergedProgress
+                        mergedProgress,
+                        true
                     );
 
-                    log('Прогресс обновлён');
+                    log('Обновлён прогресс');
                 }
 
                 log('OK', {
@@ -468,21 +510,14 @@
                         mergedFavorite,
                         'history'
                     ),
-                    like: count(
-                        mergedFavorite,
-                        'like'
-                    ),
-                    book: count(
-                        mergedFavorite,
-                        'book'
-                    ),
                     card: count(
                         mergedFavorite,
                         'card'
                     ),
                     progress: Object.keys(
                         mergedProgress
-                    ).length
+                    ).length,
+                    refreshed: favoriteChanged
                 });
 
                 if (showMessage) {
@@ -494,8 +529,92 @@
                 if (showMessage) {
                     notify('Ошибка обработки данных');
                 }
+            } finally {
+                applying = false;
+            }
+
+            if (pending) {
+                pending = false;
+
+                setTimeout(function () {
+                    syncNow(false);
+                }, 1000);
             }
         });
+    }
+
+    /*
+     * Объединяем несколько изменений в один запрос.
+     */
+    function scheduleSync(delay) {
+        if (applying) return;
+
+        clearTimeout(debounceTimer);
+
+        debounceTimer = setTimeout(function () {
+            debounceTimer = null;
+            syncNow(false);
+        }, delay || 2000);
+    }
+
+    /*
+     * Открытие избранного / истории.
+     */
+    function onActivity(event) {
+        if (!event || event.type !== 'start') {
+            return;
+        }
+
+        if (
+            event.component !== 'bookmarks' &&
+            event.component !== 'favorite'
+        ) {
+            return;
+        }
+
+        /*
+         * Защита от повторных событий
+         * при быстром переключении экранов.
+         */
+        var now = Date.now();
+
+        if (now - lastNavigationSync < 1500) {
+            return;
+        }
+
+        lastNavigationSync = now;
+
+        log(
+            'Открыт раздел:',
+            event.component,
+            event.object && event.object.type
+        );
+
+        scheduleSync(300);
+    }
+
+    function onFavoriteState(event) {
+        if (!event || applying) return;
+
+        if (
+            event.target === 'favorite' &&
+            event.reason === 'update'
+        ) {
+            scheduleSync(2000);
+        }
+    }
+
+    function onStorageChange(event) {
+        if (!event || applying) return;
+
+        /*
+         * Изменение прогресса воспроизведения.
+         * Не реагируем на все остальные
+         * настройки Lampa.
+         */
+        if (event.name === 'file_view') {
+            scheduleSync(5000);
+        }
     }
 
     function openCodeDialog() {
@@ -560,7 +679,7 @@
         Lampa.SettingsApi.addParam({
             component: 'more',
             param: {
-                name: 'lampa_sync_code_v7',
+                name: 'lampa_sync_code_v8',
                 type: 'button'
             },
             field: {
@@ -572,13 +691,15 @@
         Lampa.SettingsApi.addParam({
             component: 'more',
             param: {
-                name: 'lampa_sync_now_v7',
+                name: 'lampa_sync_now_v8',
                 type: 'button'
             },
             field: {
                 name: 'Sync: синхронизировать сейчас'
             },
             onChange: function () {
+                clearTimeout(debounceTimer);
+                debounceTimer = null;
                 syncNow(true);
             }
         });
@@ -590,9 +711,11 @@
         if (
             !window.Lampa ||
             !Lampa.Storage ||
+            !Lampa.Storage.listener ||
             !Lampa.Favorite ||
             !Lampa.Favorite.full ||
             !Lampa.Favorite.read ||
+            !Lampa.Listener ||
             !Lampa.SettingsApi ||
             !Lampa.SettingsApi.addParam ||
             !Lampa.Input
@@ -604,19 +727,30 @@
 
         installSettings();
 
+        Lampa.Listener.follow(
+            'activity',
+            onActivity
+        );
+
+        Lampa.Listener.follow(
+            'state:changed',
+            onFavoriteState
+        );
+
+        Lampa.Storage.listener.follow(
+            'change',
+            onStorageChange
+        );
+
         window.lampaCustomSyncNow = function () {
             syncNow(true);
         };
 
         window.lampaCustomSyncCode = openCodeDialog;
 
-        setInterval(function () {
-            syncNow(false);
-        }, 30000);
-
         /*
-         * Если код сохранён, синхронизируемся.
-         * Клавиатуру автоматически НЕ открываем.
+         * Одна синхронизация при запуске.
+         * Периодических таймеров НЕТ.
          */
         if (validCode(getCode())) {
             setTimeout(function () {
@@ -624,7 +758,10 @@
             }, 3000);
         }
 
-        log('Запущен. XMLHttpRequest активен.');
+        log(
+            'Запущен: синхронизация по событиям, без опроса'
+        );
+
         return true;
     }
 
